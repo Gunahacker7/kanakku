@@ -1,0 +1,13 @@
+.dart_tool/
+**/.dart_tool/
+build/
+**/build/
+__pycache__/
+*.pyc
+*.iml
+app/android/local.properties
+# Signing material must NEVER be committed (v1.0.4) — the real
+# keystore + passwords live outside the repo in ~/.kanakku-signing/.
+*.jks
+*.keystore
+key.properties
