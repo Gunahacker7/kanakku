@@ -55,5 +55,6 @@ from Google Fonts.
 
 ## Status
 
-Current release: **v1.1.3** — durable manual saves, username profile card,
-glass footer, Fraunces/Manrope type. Built and maintained by Gunasekar E.
+Current release: **v1.1.5** — download the APK from
+[GitHub Releases](https://github.com/Gunahacker7/kanakku/releases/tag/v1.1.5).
+Built and maintained by Gunasekar E.
