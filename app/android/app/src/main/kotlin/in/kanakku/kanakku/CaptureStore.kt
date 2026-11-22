@@ -35,6 +35,8 @@ object CaptureStore {
     private const val KEY_RECURRING = "recurring_store"
     private const val KEY_ALERT_STATE = "alert_state_store"
     private const val KEY_MIGRATED_V110 = "migrated_v110"
+    private const val KEY_SUBSCRIPTIONS = "subscriptions_store"
+    private const val KEY_MIGRATED_V120 = "migrated_v120"
     private const val MAX_ITEMS = 500
 
     private fun prefs(context: Context) =
@@ -152,6 +154,28 @@ object CaptureStore {
     fun alertState(context: Context): String = getDoc(context, KEY_ALERT_STATE, "")
     fun setAlertState(context: Context, json: String) {
         putDoc(context, KEY_ALERT_STATE, json)
+    }
+
+    /** Subscriptions document (JSON from Dart, v1.2). Commit
+     * write, like the recurring store. */
+    fun subscriptions(context: Context): String = getDoc(context, KEY_SUBSCRIPTIONS, "")
+    fun setSubscriptions(context: Context, json: String): Boolean =
+        putDocCommit(context, KEY_SUBSCRIPTIONS, json)
+
+    /**
+     * One-time v1.2 migration: seed the subscriptions document
+     * when — and only when — it is absent. Idempotent, guarded by
+     * [KEY_MIGRATED_V120]; the Dart side repeats the same absence
+     * check before the Shell loads.
+     */
+    @Synchronized
+    fun runV120Migrations(context: Context) {
+        val p = prefs(context)
+        if (p.getBoolean(KEY_MIGRATED_V120, false)) return
+        if (!p.contains(KEY_SUBSCRIPTIONS)) {
+            putDoc(context, KEY_SUBSCRIPTIONS, "{\"nextSubSeq\":1,\"subscriptions\":[]}")
+        }
+        p.edit().putBoolean(KEY_MIGRATED_V120, true).apply()
     }
 
     /**

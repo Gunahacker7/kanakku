@@ -46,6 +46,8 @@ void installCaptureChannelMock() {
           // a fresh install, so the migration seeding path runs.
           case 'getRecurring':
           case 'getAlertState':
+          // v1.2: same for the subscriptions store.
+          case 'getSubscriptions':
             return '';
           case 'biometricStatus':
             return 'unsupportedApi';
@@ -58,6 +60,7 @@ void installCaptureChannelMock() {
           case 'setCategories':
           case 'setRecurring':
           case 'setAlertState':
+          case 'setSubscriptions':
           case 'setDailySummary':
             return true;
           case 'shareCsv':

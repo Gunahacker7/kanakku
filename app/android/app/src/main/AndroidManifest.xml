@@ -54,6 +54,18 @@
         <receiver
             android:name=".DailySummaryReceiver"
             android:exported="false"/>
+        <!-- Upcoming renewals home-screen widget (v1.2 Phase 3). -->
+        <receiver
+            android:name=".UpcomingWidget"
+            android:exported="false"
+            android:label="Upcoming renewals">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE"/>
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/upcoming_widget_info"/>
+        </receiver>
         <receiver
             android:name=".BootReceiver"
             android:exported="true">

@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
-import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -12,6 +11,7 @@ import 'package:kanakku_parser/categorize.dart';
 import 'backup.dart';
 import 'budget_alerts.dart';
 import 'budgets.dart';
+import 'calendar.dart';
 import 'capture.dart';
 import 'categories.dart';
 import 'csv_export.dart';
@@ -24,6 +24,8 @@ import 'recurring.dart';
 import 'settings.dart';
 import 'splits.dart';
 import 'statement.dart';
+import 'subscriptions.dart';
+import 'subscriptions_ui.dart';
 import 'summary.dart';
 import 'theme.dart';
 
@@ -124,6 +126,10 @@ class _AppGateState extends State<_AppGate> with WidgetsBindingObserver {
       }
       if ((await _capture.loadAlertStateJson()).isEmpty) {
         await _capture.saveAlertStateJson('{}');
+      }
+      // v1.2: same seeding for the subscriptions document.
+      if ((await _capture.loadSubscriptionsJson()).isEmpty) {
+        await _capture.saveSubscriptionsJson(emptySubscriptionsStoreJson);
       }
     } catch (_) {}
     try {
@@ -668,7 +674,7 @@ String periodLabel(PeriodSel p) => switch (p) {
 /// (78 bar + 14 bottom margin + ~24 gesture-inset allowance =
 /// 116), the old 120 left only ~4px of slack; 132 restores
 /// ~16px of breathing room above the pill at end-of-scroll.
-const _pagePadding = EdgeInsets.fromLTRB(20, 8, 20, 132);
+const _pagePadding = EdgeInsets.fromLTRB(20, 8, 20, 28);
 
 class Shell extends StatefulWidget {
   final void Function(String) onThemePref;
@@ -693,6 +699,10 @@ class _ShellState extends State<Shell> with WidgetsBindingObserver {
   /// refresh, mutated by the engine pass / alert evaluation.
   Map<String, dynamic> _recurringDoc = emptyRecurringStore();
   Map<String, dynamic> _alertState = <String, dynamic>{};
+
+  /// v1.2: subscriptions document, loaded on refresh, mutated only
+  /// through the Subscriptions page's onApply hand-back.
+  Map<String, dynamic> _subsDoc = emptySubscriptionsStore();
 
   /// One-per-rule in-app notices from the latest engine pass
   /// (spec §3.3 step 0), shown on the Recurring screen.
@@ -886,6 +896,10 @@ class _ShellState extends State<Shell> with WidgetsBindingObserver {
     // v1.1: recurring document + alert state.
     _recurringDoc = decodeRecurringStore(await _capture.loadRecurringJson());
     _alertState = decodeAlertState(await _capture.loadAlertStateJson());
+    // v1.2: subscriptions document.
+    _subsDoc = decodeSubscriptionsStore(
+      await _capture.loadSubscriptionsJson(),
+    );
     // v1.1 (spec §6.2): a restore that crashed mid-write left the
     // restore_in_progress flag set — clear it and put the
     // recurring document, exactly as found, under the restore hold
@@ -973,6 +987,103 @@ class _ShellState extends State<Shell> with WidgetsBindingObserver {
       if (mounted) setState(_rebuild);
     }
     await _evaluateBudgetAlerts();
+    await _evaluateRenewalReminders();
+  }
+
+  /// v1.2 renewal reminders: evaluated on app open like the budget
+  /// alerts (there is no OS-level scheduler in the app — the daily
+  /// summary alarm carries fixed text only). A subscription whose
+  /// next renewal is tomorrow posts ONE notification through the
+  /// existing notifier channel; the alert-state document dedupes
+  /// per renewal date, and only actually-posted notifications are
+  /// recorded. At most 2 post per evaluation, like the budget cap.
+  Future<void> _evaluateRenewalReminders() async {
+    if (_restoreInProgress) return;
+    final today = dateStr(DateTime.now());
+    final pending = pendingRenewalReminders(_subsDoc, _alertState, today);
+    var posted = 0;
+    var stateChanged = false;
+    for (final u in pending) {
+      if (posted >= 2) break;
+      final name = u.sub['name']?.toString() ?? 'Subscription';
+      final amount = KanakkuTheme.inr(
+        rupeesFromPaise((u.sub['amountPaise'] as num).toInt()),
+      );
+      final ok = await _capture.postBudgetAlert(
+        'Subscription renewing tomorrow',
+        '$name · $amount renews on ${fmtSubDate(u.date)}',
+      );
+      if (ok) {
+        posted++;
+        markRenewalReminded(_alertState, u.sub['id'] as String, u.date);
+        stateChanged = true;
+      }
+    }
+    if (stateChanged) {
+      await _capture.saveAlertStateJson(encodeAlertState(_alertState));
+    }
+  }
+
+  /// v1.2: captured/manual debits as plain payment views for the
+  /// subscription screens' read-only capture matching.
+  List<SubPaymentView> _subPayments() => [
+    for (final e in _entries)
+      if (e.txn.direction == TxnDirection.debit)
+        SubPaymentView(
+          name: e.txn.counterparty ?? e.label,
+          amountPaise: paiseFromRupees(e.txn.amount),
+          date: dateStr(e.txn.receivedAt),
+        ),
+  ];
+
+  /// v1.2: Calendar tab items — every transaction plus subscription
+  /// renewals across a wide window (6 months back, 12 ahead) so
+  /// month navigation always has its renewals computed.
+  List<CalendarItem> _calendarItems() {
+    final today = dateStr(DateTime.now());
+    final from = addDaysStr(today, -190);
+    final to = addDaysStr(today, 370);
+    return [
+      for (final e in _entries)
+        CalendarItem(
+          date: dateStr(e.txn.receivedAt),
+          name: e.label,
+          amountPaise: paiseFromRupees(e.txn.amount),
+          isCredit: e.txn.direction == TxnDirection.credit,
+          category: e.category,
+        ),
+      for (final sub in subscriptionsOf(_subsDoc))
+        for (final d in renewalsInRange(sub, from, to, today))
+          CalendarItem(
+            date: d,
+            name: sub['name']?.toString() ?? '',
+            amountPaise: (sub['amountPaise'] as num).toInt(),
+            isRenewal: true,
+            brandKey: sub['brandKey']?.toString(),
+          ),
+    ];
+  }
+
+  /// v1.2: the Subscriptions module (list / add / details). The
+  /// page works on a copy and hands back the full updated
+  /// document; the Shell persists it and re-evaluates reminders.
+  void _openSubscriptions() {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => SubscriptionsPage(
+          doc: decodeSubscriptionsStore(encodeSubscriptionsStore(_subsDoc)),
+          payments: _subPayments(),
+          onApply: (doc) async {
+            _subsDoc = doc;
+            await _capture.saveSubscriptionsJson(
+              encodeSubscriptionsStore(doc),
+            );
+            if (mounted) setState(() {});
+            await _evaluateRenewalReminders();
+          },
+        ),
+      ),
+    );
   }
 
   /// v1.1 budget-alert evaluation (spec §4.1): runs after captures
@@ -1243,6 +1354,8 @@ class _ShellState extends State<Shell> with WidgetsBindingObserver {
     // v1.1 (spec §6.2): recurring rules ride inside the same
     // backup envelope; alert state is never backed up.
     'recurring': await _capture.loadRecurringJson(),
+    // v1.2: subscriptions ride along the same additive way.
+    'subscriptions': await _capture.loadSubscriptionsJson(),
   };
 
   /// Offers plain vs passphrase-encrypted backup (v1.0.4, audit
@@ -1481,6 +1594,12 @@ class _ShellState extends State<Shell> with WidgetsBindingObserver {
       );
       await _capture.saveRecurringJson(encodeRecurringStore(held));
     }
+    // v1.2: subscriptions restore verbatim (no engine hold — the
+    // module never posts entries). An absent key (older backup)
+    // leaves the current subscriptions untouched.
+    if (s.containsKey('subscriptions')) {
+      await _capture.saveSubscriptionsJson(s['subscriptions']!);
+    }
     if (parsed.settings != null) {
       await _capture.saveSettingsJson(
         encodeSettings(
@@ -1532,6 +1651,7 @@ class _ShellState extends State<Shell> with WidgetsBindingObserver {
       _removed.clear();
       _splits.clear();
       _recurringDoc = emptyRecurringStore();
+      _subsDoc = emptySubscriptionsStore();
       _alertState = <String, dynamic>{};
       _recurringNotices = const [];
       _realCache.clear();
@@ -1629,28 +1749,103 @@ class _ShellState extends State<Shell> with WidgetsBindingObserver {
     );
   }
 
-  void _openSettings() {
-    Navigator.of(context).push(
-      MaterialPageRoute<void>(
-        builder: (_) => _SettingsPage(
-          capture: _capture,
-          settings: _settings,
-          onSettingsChanged: _applySettings,
-          summaryLine: _summary.line,
-          onBackup: _doBackup,
-          onRestore: _doRestore,
-          onExport: _showExportChooser,
-          onImportStatement: _uploadStatement,
-          onOpenCategories: _openCategories,
-          onWipeData: _wipeAll,
-          onJumpTab: (i) {
-            setState(() => _tab = i);
-            Navigator.of(context).pop();
-          },
-        ),
-      ),
-    );
+  // ---- v1.2 shell navigation --------------------------------------
+  // The shell has exactly three tabs (Home · Calendar · Settings).
+  // The former tab pages — Transactions, Budgets, Insights, Splits —
+  // stay fully reachable as pushed pages from Home shortcuts and
+  // the Settings tab's jump chips, so no feature is lost.
+
+  /// Wraps a former tab page in a standalone route scaffold.
+  Widget _pushedPage(Widget child) => Scaffold(
+    backgroundColor: KanakkuTheme.cream,
+    body: SafeArea(bottom: false, child: child),
+  );
+
+  void _pushPage(Widget child) {
+    Navigator.of(
+      context,
+    ).push(MaterialPageRoute<void>(builder: (_) => _pushedPage(child)));
   }
+
+  void _openTransactionsPage() => _pushPage(
+    _Transactions(
+      entries: _entries,
+      onRemove: (e) => _removeEntry(e, context),
+      onSplit: _openSplitSheet,
+      removedCount: _removed.length,
+      onOpenRemoved: () => _showRemovedSheet(context),
+      onAdd: () => _openAdd(context),
+      onUploadStatement: _uploadStatement,
+      onRepeat: _startRepeat,
+      onEditEntry: _editManualEntry,
+    ),
+  );
+
+  void _openBudgetsPage() => _pushPage(
+    _Budgets(
+      entries: _entries,
+      caps: _caps,
+      onEditBudget: _editBudget,
+      windowStart: _monthWin.$1,
+      windowEnd: _monthWin.$2,
+      firedByCategory: {
+        for (final c in _caps.keys)
+          c: firedThresholds(
+            _alertState,
+            _budgetMonthKey(DateTime.now()),
+            categoryAlertKey(c),
+          ),
+      },
+    ),
+  );
+
+  void _openInsightsPage() => _pushPage(
+    _Insights(
+      entries: _entries,
+      period: _period,
+      onPeriodChanged: (p) => setState(() => _period = p),
+      onExportCsv: _exportCsv,
+      onExportPdf: _exportPdf,
+      hasStatement: _statement.isNotEmpty,
+      onOpenAnalysis: _openAnalysis,
+      monthStartDay: _settings.monthStartDay,
+    ),
+  );
+
+  void _openSplitsPage() => _pushPage(
+    _SplitsPage(
+      splits: _splits,
+      onToggleShare: _toggleShareSettled,
+      onDelete: _deleteSplit,
+    ),
+  );
+
+  /// The Settings tab: the existing settings page, hosted in the
+  /// shell instead of pushed. Its jump chips (Transactions /
+  /// Budgets / Insights — indices kept from the old tab order)
+  /// open the matching pushed page.
+  Widget _settingsTab() => _SettingsPage(
+    capture: _capture,
+    settings: _settings,
+    onSettingsChanged: _applySettings,
+    summaryLine: _summary.line,
+    onBackup: _doBackup,
+    onRestore: _doRestore,
+    onExport: _showExportChooser,
+    onImportStatement: _uploadStatement,
+    onOpenCategories: _openCategories,
+    onWipeData: _wipeAll,
+    onJumpTab: (i) {
+      switch (i) {
+        case 1:
+          _openTransactionsPage();
+        case 2:
+          _openBudgetsPage();
+        case 3:
+          _openInsightsPage();
+      }
+    },
+  );
 
   // ---- Budgets (v0.7) ----------------------------------------------
 
@@ -1661,14 +1856,21 @@ class _ShellState extends State<Shell> with WidgetsBindingObserver {
     final result = await showDialog<(String, double?)>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: Text('Monthly budget — $category'),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(KanakkuTheme.cardRadius),
+        ),
+        backgroundColor: KanakkuTheme.card,
+        title: Text(
+          'Monthly budget — $category',
+          style: KanakkuTheme.sectionTitle(size: 18),
+        ),
         content: TextField(
           controller: ctrl,
           keyboardType: const TextInputType.numberWithOptions(decimal: true),
           autofocus: true,
-          decoration: const InputDecoration(
-            prefixText: '₹ ',
-            labelText: 'Budget per month',
+          decoration: KanakkuTheme.wellDecoration(
+            prefix: '₹ ',
+            label: 'Budget per month',
           ),
         ),
         actions: [
@@ -1684,6 +1886,9 @@ class _ShellState extends State<Shell> with WidgetsBindingObserver {
             child: const Text('Cancel'),
           ),
           FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: KanakkuTheme.primary,
+            ),
             onPressed: () => Navigator.pop(
               ctx,
               ('save', double.tryParse(ctrl.text.replaceAll(',', ''))),
@@ -2104,7 +2309,14 @@ class _ShellState extends State<Shell> with WidgetsBindingObserver {
     final saved = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: Text('Edit — ${map['label']}'),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(KanakkuTheme.cardRadius),
+        ),
+        backgroundColor: KanakkuTheme.card,
+        title: Text(
+          'Edit — ${map['label']}',
+          style: KanakkuTheme.sectionTitle(size: 18),
+        ),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -2114,14 +2326,15 @@ class _ShellState extends State<Shell> with WidgetsBindingObserver {
                 decimal: true,
               ),
               autofocus: true,
-              decoration: const InputDecoration(
-                prefixText: '₹ ',
-                labelText: 'Amount',
+              decoration: KanakkuTheme.wellDecoration(
+                prefix: '₹ ',
+                label: 'Amount',
               ),
             ),
+            const SizedBox(height: 10),
             TextField(
               controller: noteCtl,
-              decoration: const InputDecoration(labelText: 'Note'),
+              decoration: KanakkuTheme.wellDecoration(label: 'Note'),
             ),
           ],
         ),
@@ -2131,6 +2344,9 @@ class _ShellState extends State<Shell> with WidgetsBindingObserver {
             child: const Text('Cancel'),
           ),
           FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: KanakkuTheme.primary,
+            ),
             onPressed: () => Navigator.pop(ctx, true),
             child: const Text('Save'),
           ),
@@ -2221,6 +2437,10 @@ class _ShellState extends State<Shell> with WidgetsBindingObserver {
 
   @override
   Widget build(BuildContext context) {
+    // v1.2 shell: three tabs only — Home · Calendar · Settings.
+    // Transactions / Budgets / Insights / Splits are pushed pages
+    // (see _openTransactionsPage & friends), reached from the Home
+    // shortcuts and the Settings jump chips.
     final pages = [
       _Home(
         entries: _entries,
@@ -2252,10 +2472,10 @@ class _ShellState extends State<Shell> with WidgetsBindingObserver {
         onTestSummary: _sendTestSummary,
         onExportCsv: _exportCsv,
         onExportPdf: _exportPdf,
-        onViewAll: () => setState(() => _tab = 1),
+        onViewAll: _openTransactionsPage,
         onAdd: () => _openAdd(context),
         onEditBudget: _editBudget,
-        onManageBudgets: () => setState(() => _tab = 2),
+        onManageBudgets: _openBudgetsPage,
         onUploadStatement: _uploadStatement,
         onOpenAnalysis: _openAnalysis,
         // v1.1: budget-alert banner + Recurring entry point.
@@ -2273,69 +2493,27 @@ class _ShellState extends State<Shell> with WidgetsBindingObserver {
         recurringFlagged: _flaggedOccurrenceCount,
         onRepeat: _startRepeat,
         onEditEntry: _editManualEntry,
+        // v1.2: greeting name + Explore links.
+        userName: _settings.profileName,
+        onOpenInsights: _openInsightsPage,
+        onOpenSplits: _openSplitsPage,
+        // v1.2: Subscriptions section (upcoming renewals preview).
+        subsDoc: _subsDoc,
+        onOpenSubscriptions: _openSubscriptions,
       ),
-      _Transactions(
-        entries: _entries,
-        onRemove: (e) => _removeEntry(e, context),
-        onSplit: _openSplitSheet,
-        removedCount: _removed.length,
-        onOpenRemoved: () => _showRemovedSheet(context),
-        onAdd: () => _openAdd(context),
-        onUploadStatement: _uploadStatement,
-        onRepeat: _startRepeat,
-        onEditEntry: _editManualEntry,
+      CalendarPage(
+        items: _calendarItems(),
+        today: dateStr(DateTime.now()),
       ),
-      _Budgets(
-        entries: _entries,
-        caps: _caps,
-        onEditBudget: _editBudget,
-        windowStart: _monthWin.$1,
-        windowEnd: _monthWin.$2,
-        firedByCategory: {
-          for (final c in _caps.keys)
-            c: firedThresholds(
-              _alertState,
-              _budgetMonthKey(DateTime.now()),
-              categoryAlertKey(c),
-            ),
-        },
-      ),
-      _Insights(
-        entries: _entries,
-        period: _period,
-        onPeriodChanged: (p) => setState(() => _period = p),
-        onExportCsv: _exportCsv,
-        onExportPdf: _exportPdf,
-        hasStatement: _statement.isNotEmpty,
-        onOpenAnalysis: _openAnalysis,
-        monthStartDay: _settings.monthStartDay,
-      ),
-      _SplitsPage(
-        splits: _splits,
-        onToggleShare: _toggleShareSettled,
-        onDelete: _deleteSplit,
-      ),
+      _settingsTab(),
     ];
     return Scaffold(
-      // v1.0.1: the glass footer floats — page content scrolls
-      // behind its blur (each page carries extra bottom padding
-      // so its last rows can still scroll clear of the pill).
-      extendBody: true,
-      body: Column(
-        children: [
-          _BrandBar(onSettings: _openSettings),
-          Expanded(child: pages[_tab]),
-        ],
-      ),
-      bottomNavigationBar: _GlassBottomNav(
+      body: pages[_tab],
+      bottomNavigationBar: _BottomNav(
         selected: _tab,
         onSelect: (i) {
           if (_settings.haptics) HapticFeedback.selectionClick();
           setState(() => _tab = i);
-        },
-        onAdd: () {
-          if (_settings.haptics) HapticFeedback.selectionClick();
-          _openAdd(context);
         },
       ),
     );
@@ -2516,7 +2694,7 @@ class _AddSheetState extends State<_AddSheet> {
         children: [
           Text(
             _isIncome ? 'Add income' : 'Log expense',
-            style: KanakkuTheme.serif(size: 19),
+            style: KanakkuTheme.sectionTitle(size: 19),
           ),
           const SizedBox(height: 12),
           // Expense | Income toggle (v0.8), teal selected state.
@@ -2547,7 +2725,7 @@ class _AddSheetState extends State<_AddSheet> {
             controller: _amount,
             keyboardType: const TextInputType.numberWithOptions(decimal: true),
             autofocus: true,
-            style: const TextStyle(fontSize: 28, fontWeight: FontWeight.w800),
+            style: KanakkuTheme.amount(size: 30),
             decoration: const InputDecoration(
               prefixText: '₹ ',
               border: InputBorder.none,
@@ -2558,12 +2736,12 @@ class _AddSheetState extends State<_AddSheet> {
           // v0.9 date row (both modes): tap to open the calendar.
           InkWell(
             onTap: _pickDate,
-            borderRadius: BorderRadius.circular(12),
+            borderRadius: BorderRadius.circular(16),
             child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
               decoration: BoxDecoration(
                 color: KanakkuTheme.tealSoft,
-                borderRadius: BorderRadius.circular(12),
+                borderRadius: BorderRadius.circular(16),
               ),
               child: Row(
                 children: [
@@ -2598,6 +2776,8 @@ class _AddSheetState extends State<_AddSheet> {
                 label: const Text('Today'),
                 selected: _sameDay(_date, DateTime.now()),
                 selectedColor: KanakkuTheme.tealSoft,
+                shape: KanakkuTheme.chipShape,
+                side: KanakkuTheme.chipSide,
                 onSelected: (_) => setState(() => _date = DateTime.now()),
               ),
               const SizedBox(width: 8),
@@ -2608,6 +2788,8 @@ class _AddSheetState extends State<_AddSheet> {
                   DateTime.now().subtract(const Duration(days: 1)),
                 ),
                 selectedColor: KanakkuTheme.tealSoft,
+                shape: KanakkuTheme.chipShape,
+                side: KanakkuTheme.chipSide,
                 onSelected: (_) => setState(
                   () =>
                       _date = DateTime.now().subtract(const Duration(days: 1)),
@@ -2627,6 +2809,9 @@ class _AddSheetState extends State<_AddSheet> {
                         b.name[0].toUpperCase() + b.name.substring(1),
                       ),
                       selected: _bucket == b,
+                      selectedColor: KanakkuTheme.tealSoft,
+                      shape: KanakkuTheme.chipShape,
+                      side: KanakkuTheme.chipSide,
                       onSelected: (_) => setState(() {
                         _bucket = b;
                         _sub = _subs[b]!.first;
@@ -2642,7 +2827,7 @@ class _AddSheetState extends State<_AddSheet> {
                   .map((s) => DropdownMenuItem(value: s, child: Text(s)))
                   .toList(),
               onChanged: (v) => setState(() => _sub = v!),
-              decoration: const InputDecoration(labelText: 'Subcategory'),
+              decoration: KanakkuTheme.wellDecoration(label: 'Subcategory'),
             ),
           ] else ...[
             Text(
@@ -2663,6 +2848,8 @@ class _AddSheetState extends State<_AddSheet> {
                     label: Text(t),
                     selected: _incomeType == t,
                     selectedColor: KanakkuTheme.tealSoft,
+                    shape: KanakkuTheme.chipShape,
+                    side: KanakkuTheme.chipSide,
                     onSelected: (_) => setState(() => _incomeType = t),
                   ),
               ],
@@ -2670,9 +2857,9 @@ class _AddSheetState extends State<_AddSheet> {
             if (_incomeType == 'Other')
               TextField(
                 controller: _customType,
-                decoration: const InputDecoration(
-                  labelText: 'Income name',
-                  hintText: 'e.g. Sold old phone',
+                decoration: KanakkuTheme.wellDecoration(
+                  label: 'Income name',
+                  hint: 'e.g. Sold old phone',
                 ),
               ),
           ],
@@ -2696,20 +2883,23 @@ class _AddSheetState extends State<_AddSheet> {
                   label: Text(m),
                   selected: _mode == m,
                   selectedColor: KanakkuTheme.tealSoft,
+                  shape: KanakkuTheme.chipShape,
+                  side: KanakkuTheme.chipSide,
                   onSelected: (_) => setState(() => _mode = m),
                 ),
             ],
           ),
           TextField(
             controller: _note,
-            decoration: const InputDecoration(labelText: 'Note (optional)'),
+            decoration: KanakkuTheme.wellDecoration(label: 'Note (optional)'),
           ),
+          const SizedBox(height: 10),
           // v1.0: single optional tag (drives the Transactions filter).
           TextField(
             controller: _tag,
-            decoration: const InputDecoration(
-              labelText: 'Tag (optional)',
-              hintText: 'e.g. Trip, Office, Family',
+            decoration: KanakkuTheme.wellDecoration(
+              label: 'Tag (optional)',
+              hint: 'e.g. Trip, Office, Family',
             ),
           ),
           const SizedBox(height: 16),
@@ -2717,8 +2907,11 @@ class _AddSheetState extends State<_AddSheet> {
             width: double.infinity,
             child: FilledButton(
               style: FilledButton.styleFrom(
-                backgroundColor: KanakkuTheme.orange,
+                backgroundColor: KanakkuTheme.primary,
                 padding: const EdgeInsets.symmetric(vertical: 14),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(20),
+                ),
               ),
               onPressed: _saving
                   ? null
@@ -2885,6 +3078,11 @@ class _Home extends StatelessWidget {
     this.recurringFlagged = 0,
     required this.onRepeat,
     required this.onEditEntry,
+    required this.userName,
+    required this.onOpenInsights,
+    required this.onOpenSplits,
+    required this.subsDoc,
+    required this.onOpenSubscriptions,
   });
 
   /// v1.0 Home Page Balance View: 'net' (period net flow, the
@@ -2899,26 +3097,19 @@ class _Home extends StatelessWidget {
   final DateTime windowStart;
   final DateTime windowEnd;
 
+  /// v1.2: greeting name (Settings → Profile name) and the Explore
+  /// shortcuts to the pushed Insights / Splits pages.
+  final String userName;
+  final VoidCallback onOpenInsights;
+  final VoidCallback onOpenSplits;
+
+  /// v1.2: the subscriptions document (for the Upcoming preview
+  /// section) + the entry point into the Subscriptions module.
+  final Map<String, dynamic> subsDoc;
+  final VoidCallback onOpenSubscriptions;
+
   @override
   Widget build(BuildContext context) {
-    var income = 0.0, expenses = 0.0;
-    for (final e in periodEntries) {
-      if (e.txn.direction == TxnDirection.debit) {
-        expenses += e.txn.amount;
-      } else {
-        income += e.txn.amount;
-      }
-    }
-    final net = income - expenses;
-    final rate = income > 0 ? net / income : 0.0;
-    final rateLabel = income <= 0
-        ? 'No income in this period'
-        : rate >= 0.5
-        ? 'Healthy pace'
-        : rate < 0.2
-        ? 'Tight'
-        : 'Steady';
-
     final recent = [...entries]
       ..sort((a, b) => b.txn.receivedAt.compareTo(a.txn.receivedAt));
 
@@ -2936,23 +3127,66 @@ class _Home extends StatelessWidget {
       spentByCat[cat] = (spentByCat[cat] ?? 0) + e.txn.amount;
     }
 
-    // v1.0 hero: 'accounts' view shows the sum of latest balances
-    // when any account exists, else falls back to the net flow.
-    final accountsTotal = accounts.fold<double>(0, (s, a) => s + a.balance);
-    final heroIsAccounts = balanceView == 'accounts' && accounts.isNotEmpty;
-    final heroAmount = heroIsAccounts ? accountsTotal : net;
     final checkIn = budgetRows(caps, spentByCat)
       ..sort((a, b) => b.spent.compareTo(a.spent));
 
     return ListView(
       padding: _pagePadding,
       children: [
-        Text(
-          '${greetingFor(now)} 👋',
-          style: TextStyle(color: KanakkuTheme.inkSoft, fontSize: 14),
+        // v1.2 greeting header (reference 02): avatar + greeting +
+        // name, circular deep-green + opening the Add sheet.
+        SafeArea(
+          bottom: false,
+          child: Row(
+            children: [
+              CircleAvatar(
+                radius: 24,
+                backgroundColor: KanakkuTheme.primary,
+                child: Text(
+                  userName.isEmpty ? '?' : userName[0].toUpperCase(),
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 19,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      greetingFor(now),
+                      style: KanakkuTheme.secondary(size: 13.5),
+                    ),
+                    Text(
+                      userName.isEmpty ? 'Guest' : userName.toUpperCase(),
+                      style: KanakkuTheme.sectionTitle(size: 19),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ],
+                ),
+              ),
+              Material(
+                color: KanakkuTheme.primary,
+                shape: const CircleBorder(),
+                elevation: 3,
+                shadowColor: Colors.black26,
+                child: InkWell(
+                  customBorder: const CircleBorder(),
+                  onTap: onAdd,
+                  child: const SizedBox(
+                    width: 48,
+                    height: 48,
+                    child: Icon(Icons.add, color: Colors.white, size: 26),
+                  ),
+                ),
+              ),
+            ],
+          ),
         ),
-        const SizedBox(height: 4),
-        Text('Your money, in control.', style: KanakkuTheme.serif(size: 27)),
         // v1.1 budget-alert banner (spec §4.4): today's crossings
         // plus suppressed ones, until dismissed.
         if (bannerLines.isNotEmpty) ...[
@@ -3001,134 +3235,55 @@ class _Home extends StatelessWidget {
             ),
           ),
         ],
-        const SizedBox(height: 16),
-        Row(
-          children: [
-            _PeriodSelector(period: period, onChanged: onPeriodChanged),
-          ],
+        const SizedBox(height: 18),
+        // v1.2 stat cards + Monthly Spending chart (reference 02).
+        _HomeStats(
+          entries: entries,
+          caps: caps,
+          windowStart: windowStart,
+          windowEnd: windowEnd,
+          initialPeriod: period,
+          onPeriodChanged: onPeriodChanged,
         ),
         const SizedBox(height: 14),
-        // ---- Hero: TOTAL BALANCE ----------------------------------
-        Container(
-          decoration: BoxDecoration(
-            gradient: const LinearGradient(
-              colors: [KanakkuTheme.tealHero, KanakkuTheme.tealDark],
-              begin: Alignment.topLeft,
-              end: Alignment.bottomRight,
+        _SpendingChartCard(
+          txns: [
+            for (final e in entries)
+              InsightTxn(
+                at: e.txn.receivedAt,
+                amount: e.txn.amount,
+                isDebit: e.txn.direction == TxnDirection.debit,
+                category: e.category,
+                bucket: e.bucket,
+              ),
+          ],
+        ),
+        // ---- Subscriptions (v1.2): upcoming renewals preview -----
+        const SizedBox(height: 20),
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                'Subscriptions',
+                style: KanakkuTheme.sectionTitle(size: 18),
+              ),
             ),
-            borderRadius: BorderRadius.circular(20),
-          ),
-          padding: const EdgeInsets.all(20),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                heroIsAccounts ? 'TOTAL BALANCE · ACCOUNTS' : 'TOTAL BALANCE',
-                style: const TextStyle(
-                  color: Colors.white70,
-                  fontSize: 11,
-                  letterSpacing: 1.6,
-                  fontWeight: FontWeight.w600,
+            TextButton(
+              onPressed: onOpenSubscriptions,
+              child: const Text(
+                'View all ›',
+                style: TextStyle(
+                  color: KanakkuTheme.primary,
+                  fontWeight: FontWeight.w700,
                 ),
               ),
-              const SizedBox(height: 6),
-              Text(
-                KanakkuTheme.inr(heroAmount),
-                style: KanakkuTheme.serif(size: 36, color: Colors.white),
-              ),
-              const SizedBox(height: 16),
-              Row(
-                children: [
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Text(
-                          '↗ Income',
-                          style: TextStyle(color: Colors.white70, fontSize: 13),
-                        ),
-                        const SizedBox(height: 2),
-                        Text(
-                          KanakkuTheme.inr(income),
-                          style: KanakkuTheme.serif(
-                            size: 19,
-                            color: Colors.white,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Text(
-                          '↘ Expenses',
-                          style: TextStyle(color: Colors.white70, fontSize: 13),
-                        ),
-                        const SizedBox(height: 2),
-                        Text(
-                          KanakkuTheme.inr(expenses),
-                          style: KanakkuTheme.serif(
-                            size: 19,
-                            color: Colors.white,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ],
-              ),
-            ],
-          ),
-        ),
-        const SizedBox(height: 14),
-        // ---- 2×2 stat grid -----------------------------------------
-        Row(
-          children: [
-            Expanded(
-              child: _StatCard(
-                title: 'Net cash flow',
-                value: KanakkuTheme.inr(net),
-                sub: net >= 0
-                    ? 'Positive balance this period'
-                    : 'Spending above income',
-                filled: true,
-              ),
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: _StatCard(
-                title: 'Total income',
-                value: KanakkuTheme.inr(income),
-                sub: '↑ Inflows',
-                subColor: KanakkuTheme.credit,
-              ),
             ),
           ],
         ),
-        const SizedBox(height: 12),
-        Row(
-          children: [
-            Expanded(
-              child: _StatCard(
-                title: 'Total expenses',
-                value: KanakkuTheme.inr(expenses),
-                sub: '↓ Outflows',
-                subColor: KanakkuTheme.debit,
-              ),
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: _StatCard(
-                title: 'Savings rate',
-                value: '${(rate * 100).round()}%',
-                sub: rateLabel,
-                subColor: KanakkuTheme.teal,
-                progress: rate.clamp(0, 1).toDouble(),
-              ),
-            ),
-          ],
+        const SizedBox(height: 8),
+        _SubscriptionsPreview(
+          subsDoc: subsDoc,
+          onOpen: onOpenSubscriptions,
         ),
         if (!usingReal) ...[
           const SizedBox(height: 14),
@@ -3429,61 +3584,874 @@ class _Home extends StatelessWidget {
             ),
           ),
         ),
-        // ---- Recent transactions ------------------------------------
+        // ---- Explore (v1.2): the former tabs, one tap away --------
         const SizedBox(height: 18),
+        KCard(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
+          child: Row(
+            children: [
+              _ExploreLink(
+                icon: Icons.receipt_long_outlined,
+                label: 'Transactions',
+                onTap: onViewAll,
+              ),
+              _ExploreLink(
+                icon: Icons.insights_outlined,
+                label: 'Insights',
+                onTap: onOpenInsights,
+              ),
+              _ExploreLink(
+                icon: Icons.account_balance_wallet_outlined,
+                label: 'Budgets',
+                onTap: onManageBudgets,
+              ),
+              _ExploreLink(
+                icon: Icons.call_split_outlined,
+                label: 'Splits',
+                onTap: onOpenSplits,
+              ),
+            ],
+          ),
+        ),
+        // ---- Recent transactions (v1.2 row style) ------------------
+        const SizedBox(height: 20),
         Row(
           children: [
             Expanded(
               child: Text(
                 'Recent transactions',
-                style: KanakkuTheme.serif(size: 18),
+                style: KanakkuTheme.sectionTitle(size: 18),
               ),
             ),
-            FilledButton(
-              style: FilledButton.styleFrom(
-                backgroundColor: KanakkuTheme.teal,
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 18,
-                  vertical: 9,
-                ),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(12),
+            TextButton(
+              onPressed: onViewAll,
+              child: const Text(
+                'View all ›',
+                style: TextStyle(
+                  color: KanakkuTheme.primary,
+                  fontWeight: FontWeight.w700,
                 ),
               ),
-              onPressed: onViewAll,
-              child: const Text('View all'),
             ),
           ],
         ),
-        const SizedBox(height: 10),
-        Card(
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
-            child: recent.isEmpty
-                ? const _EmptyTxns()
-                : Column(
-                    children: [
-                      for (var i = 0; i < recent.take(5).length; i++) ...[
-                        if (i > 0) const Divider(height: 1),
-                        _TxnRowPlain(
-                          entry: recent[i],
-                          onRemove: () => onRemove(recent[i]),
-                          onSplit: () => onSplit(recent[i]),
-                          onRepeat: () => onRepeat(recent[i]),
-                          onEdit: recent[i].txn.source == TxnSource.manual
-                              ? () => onEditEntry(recent[i])
-                              : null,
-                        ),
-                      ],
+        const SizedBox(height: 8),
+        KCard(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+          child: recent.isEmpty
+              ? const _EmptyTxns()
+              : Column(
+                  children: [
+                    for (var i = 0; i < recent.take(5).length; i++) ...[
+                      if (i > 0)
+                        Divider(height: 1, color: KanakkuTheme.dividerColor),
+                      _RecentRow(
+                        entry: recent[i],
+                        onRemove: () => onRemove(recent[i]),
+                        onSplit: () => onSplit(recent[i]),
+                        onRepeat: () => onRepeat(recent[i]),
+                        onEdit: recent[i].txn.source == TxnSource.manual
+                            ? () => onEditEntry(recent[i])
+                            : null,
+                      ),
                     ],
-                  ),
-          ),
+                  ],
+                ),
         ),
         const SizedBox(height: 16),
         _TealButton(label: '+  Add transaction', onPressed: onAdd),
       ],
     );
   }
+}
+
+/// v1.2 Home Subscriptions preview (reference 02 bottom): the
+/// next three renewals in list-row style, with an "N active ·
+/// ₹X due in 30 days" footer. The whole card opens the
+/// Subscriptions module; with no subscriptions it is an invite.
+class _SubscriptionsPreview extends StatelessWidget {
+  final Map<String, dynamic> subsDoc;
+  final VoidCallback onOpen;
+  const _SubscriptionsPreview({required this.subsDoc, required this.onOpen});
+
+  @override
+  Widget build(BuildContext context) {
+    final today = dateStr(DateTime.now());
+    final upcoming = upcomingRenewals(subsDoc, today, limit: 3);
+    final activeCount = subscriptionsOf(
+      subsDoc,
+    ).where((s) => s['status'] != 'cancelled').length;
+    final due = dueWithin(subsDoc, today, 30);
+    if (subscriptionsOf(subsDoc).isEmpty) {
+      return KCard(
+        onTap: onOpen,
+        child: Row(
+          children: [
+            SubBrandTile(brand: brandFor('custom'), size: 44),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'No subscriptions yet',
+                    style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
+                  ),
+                  Text(
+                    'Track renewals — Spotify, rent, SIPs and more.',
+                    style: KanakkuTheme.secondary(size: 12.5),
+                  ),
+                ],
+              ),
+            ),
+            Icon(Icons.chevron_right, color: KanakkuTheme.inkSoft),
+          ],
+        ),
+      );
+    }
+    return KCard(
+      onTap: onOpen,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (upcoming.isEmpty)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 10),
+              child: Text(
+                'No upcoming renewals.',
+                style: KanakkuTheme.secondary(size: 13),
+              ),
+            )
+          else
+            for (var i = 0; i < upcoming.length; i++) ...[
+              if (i > 0) Divider(height: 1, color: KanakkuTheme.dividerColor),
+              SubscriptionRow(sub: upcoming[i].sub, today: today),
+            ],
+          const SizedBox(height: 6),
+          Divider(height: 1, color: KanakkuTheme.dividerColor),
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            child: Text(
+              '$activeCount active · '
+              '${KanakkuTheme.inr(rupeesFromPaise(due.totalPaise))} '
+              'due in 30 days',
+              style: KanakkuTheme.secondary(size: 12.5),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// v1.2 Home stat pair (reference 02): the period selector above
+/// two white cards — "Spent" for the selected range and "Budget
+/// left" against the monthly caps. Same underlying data as the
+/// old hero + 2×2 grid (entries + caps), new look.
+class _HomeStats extends StatefulWidget {
+  final List<_Entry> entries;
+  final Map<String, double> caps;
+  final DateTime windowStart;
+  final DateTime windowEnd;
+  final PeriodSel initialPeriod;
+  final void Function(PeriodSel) onPeriodChanged;
+  const _HomeStats({
+    required this.entries,
+    required this.caps,
+    required this.windowStart,
+    required this.windowEnd,
+    required this.initialPeriod,
+    required this.onPeriodChanged,
+  });
+  @override
+  State<_HomeStats> createState() => _HomeStatsState();
+}
+
+class _HomeStatsState extends State<_HomeStats> {
+  late PeriodSel _sel = widget.initialPeriod;
+
+  @override
+  void didUpdateWidget(_HomeStats old) {
+    super.didUpdateWidget(old);
+    if (old.initialPeriod != widget.initialPeriod) {
+      _sel = widget.initialPeriod;
+    }
+  }
+
+  double _debits(DateTime start, DateTime end) {
+    var total = 0.0;
+    for (final e in widget.entries) {
+      if (e.txn.direction != TxnDirection.debit) continue;
+      final at = e.txn.receivedAt;
+      if (!at.isBefore(start) && at.isBefore(end)) total += e.txn.amount;
+    }
+    return total;
+  }
+
+  int _debitCount(DateTime start, DateTime end) {
+    var n = 0;
+    for (final e in widget.entries) {
+      if (e.txn.direction != TxnDirection.debit) continue;
+      final at = e.txn.receivedAt;
+      if (!at.isBefore(start) && at.isBefore(end)) n++;
+    }
+    return n;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final now = DateTime.now();
+    final (start, end) = periodRange(_sel, now, 1);
+    final spent = _debits(start, end);
+    final count = _debitCount(start, end);
+    final capsTotal = widget.caps.values.fold<double>(0, (s, v) => s + v);
+    // Budget left is measured inside the current budget window
+    // (the First-Day-of-the-Month setting), whatever range the
+    // Spent card is showing.
+    final windowSpent = _debits(widget.windowStart, widget.windowEnd);
+    final left = capsTotal - windowSpent;
+    final used = capsTotal > 0 ? windowSpent / capsTotal : 0.0;
+    final spentTitle = switch (_sel) {
+      PeriodSel.thisMonth => 'Spent this month',
+      PeriodSel.lastMonth => 'Spent last month',
+      PeriodSel.allTime => 'Spent all time',
+    };
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _PeriodSelector(
+          period: _sel,
+          onChanged: (p) {
+            setState(() => _sel = p);
+            widget.onPeriodChanged(p);
+          },
+        ),
+        const SizedBox(height: 12),
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(
+              child: _RefStatCard(
+                title: spentTitle,
+                value: KanakkuTheme.inr(spent),
+                badgeLabel: '$count expense${count == 1 ? '' : 's'}',
+                badgeBg: KanakkuTheme.badgeGreyBg,
+                badgeFg: KanakkuTheme.badgeGreyFg,
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: _RefStatCard(
+                title: 'Budget left',
+                value: KanakkuTheme.inr(left),
+                badgeLabel: capsTotal > 0
+                    ? 'of ${KanakkuTheme.inrCompact(capsTotal)} budget'
+                    : 'No budgets set',
+                badgeBg: KanakkuTheme.badgeAmberBg,
+                badgeFg: KanakkuTheme.badgeAmberFg,
+                progress: capsTotal > 0 ? used : null,
+              ),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+}
+
+/// One v1.2 stat card (reference 02): grey label, big bold amount,
+/// a pill badge under the amount and the reference affordance dots.
+class _RefStatCard extends StatelessWidget {
+  final String title;
+  final String value;
+  final String badgeLabel;
+  final Color badgeBg;
+  final Color badgeFg;
+  final double? progress;
+  const _RefStatCard({
+    required this.title,
+    required this.value,
+    required this.badgeLabel,
+    required this.badgeBg,
+    required this.badgeFg,
+    this.progress,
+  });
+
+  @override
+  Widget build(BuildContext context) => KCard(
+    padding: const EdgeInsets.fromLTRB(16, 14, 12, 14),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(title, style: KanakkuTheme.secondary(size: 13)),
+        const SizedBox(height: 6),
+        FittedBox(
+          fit: BoxFit.scaleDown,
+          alignment: Alignment.centerLeft,
+          child: Text(
+            value,
+            maxLines: 1,
+            softWrap: false,
+            style: KanakkuTheme.amount(size: 21),
+          ),
+        ),
+        const SizedBox(height: 9),
+        Row(
+          children: [
+            Flexible(
+              child: PillBadge(
+                label: badgeLabel,
+                background: badgeBg,
+                foreground: badgeFg,
+              ),
+            ),
+            const Spacer(),
+            Icon(Icons.more_horiz, size: 16, color: KanakkuTheme.inkSoft),
+          ],
+        ),
+        if (progress != null) ...[
+          const SizedBox(height: 10),
+          RoundedProgress(value: progress!),
+        ],
+      ],
+    ),
+  );
+}
+
+
+/// v1.2 "Monthly Spending" card (reference 02): sage capsule bars
+/// per month with the current month in deep green, a 6M/1Y toggle
+/// and a % vs previous-month badge. Data: insights_data.monthSpend
+/// over the same InsightTxn conversion the Insights page uses.
+class _SpendingChartCard extends StatefulWidget {
+  final List<InsightTxn> txns;
+  const _SpendingChartCard({required this.txns});
+  @override
+  State<_SpendingChartCard> createState() => _SpendingChartCardState();
+}
+
+class _SpendingChartCardState extends State<_SpendingChartCard> {
+  bool _year = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final now = DateTime.now();
+    final n = _year ? 12 : 6;
+    final months = [
+      for (var i = n - 1; i >= 0; i--) DateTime(now.year, now.month - i),
+    ];
+    final totals = [for (final m in months) monthSpend(widget.txns, m)];
+    final current = totals.last;
+    final prev = totals[n - 2];
+    final pct = prev > 0 ? (current - prev) / prev * 100 : null;
+    final up = pct != null && pct >= 0;
+    var maxV = 0.0;
+    for (final t in totals) {
+      if (t > maxV) maxV = t;
+    }
+    return KCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  'Monthly Spending',
+                  style: KanakkuTheme.sectionTitle(size: 16.5),
+                ),
+              ),
+              _RangeToggle(
+                year: _year,
+                onChanged: (y) => setState(() => _year = y),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              Text(
+                KanakkuTheme.inr(current),
+                style: KanakkuTheme.amount(size: 22),
+              ),
+              const Spacer(),
+              if (pct != null) ...[
+                PillBadge(
+                  label: '${up ? '↑' : '↓'} ${pct.abs().round()}%',
+                  background: up
+                      ? KanakkuTheme.badgePinkBg
+                      : KanakkuTheme.badgeGreenBg,
+                  foreground: up
+                      ? KanakkuTheme.badgePinkFg
+                      : KanakkuTheme.badgeGreenFg,
+                ),
+                const SizedBox(width: 7),
+                Text(
+                  'vs ${_monthAbbr[months[n - 2].month - 1]}',
+                  style: KanakkuTheme.secondary(size: 12.5),
+                ),
+              ] else
+                Text(
+                  'vs ${_monthAbbr[months[n - 2].month - 1]}: no spend',
+                  style: KanakkuTheme.secondary(size: 12.5),
+                ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          SizedBox(
+            height: 104,
+            width: double.infinity,
+            child: CustomPaint(
+              painter: _BarsPainter(totals: totals, maxValue: maxV),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              for (var i = 0; i < n; i++)
+                Expanded(
+                  child: Text(
+                    _monthAbbr[months[i].month - 1],
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      fontSize: 11.5,
+                      fontWeight: i == n - 1
+                          ? FontWeight.w800
+                          : FontWeight.w500,
+                      color: i == n - 1
+                          ? KanakkuTheme.ink
+                          : KanakkuTheme.inkSoft,
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 6M / 1Y segmented pill (reference 02): the selected segment is
+/// deep green with a check; the other sits quiet on the track.
+class _RangeToggle extends StatelessWidget {
+  final bool year;
+  final void Function(bool) onChanged;
+  const _RangeToggle({required this.year, required this.onChanged});
+
+  Widget _seg(String label, bool selected, VoidCallback onTap) =>
+      GestureDetector(
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 6),
+          decoration: BoxDecoration(
+            color: selected ? KanakkuTheme.primary : Colors.transparent,
+            borderRadius: BorderRadius.circular(999),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (selected) ...[
+                const Icon(Icons.check, size: 13, color: Colors.white),
+                const SizedBox(width: 4),
+              ],
+              Text(
+                label,
+                style: TextStyle(
+                  fontSize: 12.5,
+                  fontWeight: FontWeight.w700,
+                  color: selected ? Colors.white : KanakkuTheme.inkSoft,
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+
+  @override
+  Widget build(BuildContext context) => Container(
+    padding: const EdgeInsets.all(3),
+    decoration: BoxDecoration(
+      color: KanakkuTheme.surfaceAlt,
+      borderRadius: BorderRadius.circular(999),
+    ),
+    child: Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        _seg('6M', !year, () => onChanged(false)),
+        _seg('1Y', year, () => onChanged(true)),
+      ],
+    ),
+  );
+}
+
+/// Sage capsule bars for the Monthly Spending chart: fully rounded
+/// (short bars read as dots, like the reference), bottom-aligned,
+/// the last bar — the current month — in deep green.
+class _BarsPainter extends CustomPainter {
+  final List<double> totals;
+  final double maxValue;
+  const _BarsPainter({required this.totals, required this.maxValue});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (totals.isEmpty) return;
+    final slot = size.width / totals.length;
+    final barW = math.min(30.0, slot * 0.52);
+    final inactive = Paint()..color = KanakkuTheme.sage;
+    final active = Paint()..color = KanakkuTheme.primary;
+    for (var i = 0; i < totals.length; i++) {
+      final frac = maxValue > 0 ? totals[i] / maxValue : 0.0;
+      var h = frac * size.height;
+      if (h < barW) h = barW; // minimum: a dot, never invisible
+      if (h > size.height) h = size.height;
+      final cx = slot * i + slot / 2;
+      final rect = Rect.fromLTWH(cx - barW / 2, size.height - h, barW, h);
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(rect, Radius.circular(barW / 2)),
+        i == totals.length - 1 ? active : inactive,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _BarsPainter old) =>
+      old.totals != totals || old.maxValue != maxValue;
+}
+
+/// One Explore shortcut on Home (v1.2): tinted tile + label,
+/// opening one of the former tab pages as a pushed page.
+class _ExploreLink extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final VoidCallback onTap;
+  const _ExploreLink({
+    required this.icon,
+    required this.label,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) => Expanded(
+    child: InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(14),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 4),
+        child: Column(
+          children: [
+            Container(
+              height: 44,
+              width: 44,
+              decoration: BoxDecoration(
+                color: KanakkuTheme.tealSoft,
+                borderRadius: BorderRadius.circular(14),
+              ),
+              child: Icon(icon, color: KanakkuTheme.primary, size: 21),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              label,
+              style: const TextStyle(
+                fontSize: 11.5,
+                fontWeight: FontWeight.w600,
+              ),
+              maxLines: 1,
+            ),
+          ],
+        ),
+      ),
+    ),
+  );
+}
+
+/// v1.2 transaction row (reference list style): tinted icon tile,
+/// name + sub-line (note, else "12 Nov · Category"), amount
+/// right-aligned in green with Debit/Credit under it. Same menu
+/// actions as the plain row (Repeat / Edit / Split / Remove).
+class _RecentRow extends StatelessWidget {
+  final _Entry entry;
+  final VoidCallback? onRemove;
+  final VoidCallback? onSplit;
+  final VoidCallback? onRepeat;
+  final VoidCallback? onEdit;
+  const _RecentRow({
+    required this.entry,
+    this.onRemove,
+    this.onSplit,
+    this.onRepeat,
+    this.onEdit,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final t = entry.txn;
+    final isDebit = t.direction == TxnDirection.debit;
+    final display = displayCategory(entry.category);
+    final (icon, color, chip) = _catStyle(display);
+    final sub = (entry.note != null && entry.note!.isNotEmpty)
+        ? entry.note!
+        : '${_fmtDay(t.receivedAt)} · $display';
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 10),
+      child: Row(
+        children: [
+          Container(
+            height: 46,
+            width: 46,
+            decoration: BoxDecoration(
+              color: chip,
+              borderRadius: BorderRadius.circular(14),
+            ),
+            child: Icon(
+              t.source == TxnSource.statement
+                  ? Icons.account_balance_outlined
+                  : icon,
+              color: color,
+              size: 21,
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  entry.label,
+                  style: const TextStyle(
+                    fontWeight: FontWeight.w700,
+                    fontSize: 14.5,
+                  ),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  sub,
+                  style: KanakkuTheme.secondary(size: 12),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                if (entry.tag != null) ...[
+                  const SizedBox(height: 3),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 7,
+                      vertical: 2,
+                    ),
+                    decoration: BoxDecoration(
+                      color: KanakkuTheme.tealSoft,
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Text(
+                      '#${entry.tag}',
+                      style: const TextStyle(
+                        fontSize: 10,
+                        fontWeight: FontWeight.w700,
+                        color: KanakkuTheme.tealDark,
+                      ),
+                    ),
+                  ),
+                ],
+                if (entry.origin == 'recurring') ...[
+                  const SizedBox(height: 3),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 7,
+                      vertical: 2,
+                    ),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFFDEFD2),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: const Text(
+                      '↻ Recurring',
+                      style: TextStyle(
+                        fontSize: 10,
+                        fontWeight: FontWeight.w700,
+                        color: Color(0xFFB45309),
+                      ),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+          const SizedBox(width: 8),
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              Text(
+                '${isDebit ? '-' : '+'}${KanakkuTheme.inr(t.amount)}',
+                style: TextStyle(
+                  fontWeight: FontWeight.w800,
+                  fontSize: 14.5,
+                  color: isDebit
+                      ? KanakkuTheme.primary
+                      : KanakkuTheme.credit,
+                ),
+              ),
+              const SizedBox(height: 2),
+              Text(display, style: KanakkuTheme.secondary(size: 11)),
+            ],
+          ),
+          if (onRemove != null ||
+              onSplit != null ||
+              onRepeat != null ||
+              onEdit != null)
+            PopupMenuButton<String>(
+              icon: Icon(
+                Icons.more_vert,
+                size: 20,
+                color: KanakkuTheme.inkSoft,
+              ),
+              tooltip: 'Transaction options',
+              onSelected: (v) {
+                if (v == 'remove') onRemove!();
+                if (v == 'split') onSplit!();
+                if (v == 'repeat') onRepeat!();
+                if (v == 'edit') onEdit!();
+              },
+              itemBuilder: (_) => [
+                if (onRepeat != null)
+                  const PopupMenuItem(
+                    value: 'repeat',
+                    child: Row(
+                      children: [
+                        Icon(
+                          Icons.repeat,
+                          size: 18,
+                          color: KanakkuTheme.teal,
+                        ),
+                        SizedBox(width: 8),
+                        Text('Repeat this'),
+                      ],
+                    ),
+                  ),
+                if (onEdit != null)
+                  const PopupMenuItem(
+                    value: 'edit',
+                    child: Row(
+                      children: [
+                        Icon(
+                          Icons.edit_outlined,
+                          size: 18,
+                          color: KanakkuTheme.teal,
+                        ),
+                        SizedBox(width: 8),
+                        Text('Edit entry'),
+                      ],
+                    ),
+                  ),
+                if (onSplit != null && isDebit)
+                  const PopupMenuItem(
+                    value: 'split',
+                    child: Row(
+                      children: [
+                        Icon(
+                          Icons.call_split_outlined,
+                          size: 18,
+                          color: KanakkuTheme.teal,
+                        ),
+                        SizedBox(width: 8),
+                        Text('Split bill'),
+                      ],
+                    ),
+                  ),
+                if (onRemove != null)
+                  const PopupMenuItem(
+                    value: 'remove',
+                    child: Row(
+                      children: [
+                        Icon(
+                          Icons.block_outlined,
+                          size: 18,
+                          color: KanakkuTheme.debit,
+                        ),
+                        SizedBox(width: 8),
+                        Text('Remove — not an expense'),
+                      ],
+                    ),
+                  ),
+              ],
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+/// v1.2 bottom navigation (reference 02/04): exactly three tabs —
+/// Home · Calendar · Settings — on a white bar; the active tab
+/// carries a soft pill highlight behind its icon. (Replaces the
+/// v1.0.1 floating glass bar; the Add action moved to the Home
+/// greeting header, per the reference.)
+class _BottomNav extends StatelessWidget {
+  final int selected;
+  final void Function(int) onSelect;
+  const _BottomNav({required this.selected, required this.onSelect});
+
+  static const _items = <(IconData, IconData, String)>[
+    (Icons.home_outlined, Icons.home, 'Home'),
+    (Icons.calendar_month_outlined, Icons.calendar_month, 'Calendar'),
+    (Icons.settings_outlined, Icons.settings, 'Settings'),
+  ];
+
+  Widget _item(int i) {
+    final (off, on, label) = _items[i];
+    final active = i == selected;
+    return Expanded(
+      child: GestureDetector(
+        key: ValueKey<String>('bottom-nav-item-$i'),
+        behavior: HitTestBehavior.opaque,
+        onTap: () => onSelect(i),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 4),
+              decoration: BoxDecoration(
+                color: active ? KanakkuTheme.tealSoft : Colors.transparent,
+                borderRadius: BorderRadius.circular(999),
+              ),
+              child: Icon(
+                active ? on : off,
+                size: 23,
+                color: active
+                    ? KanakkuTheme.primary
+                    : KanakkuTheme.inkSoft,
+              ),
+            ),
+            const SizedBox(height: 3),
+            Text(
+              label,
+              style: TextStyle(
+                fontSize: 11.5,
+                fontWeight: active ? FontWeight.w800 : FontWeight.w500,
+                color: active ? KanakkuTheme.ink : KanakkuTheme.inkSoft,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) => Container(
+    decoration: BoxDecoration(
+      color: KanakkuTheme.card,
+      border: Border(top: BorderSide(color: KanakkuTheme.dividerColor)),
+    ),
+    child: SafeArea(
+      top: false,
+      child: SizedBox(
+        height: 64,
+        child: Row(children: [_item(0), _item(1), _item(2)]),
+      ),
+    ),
+  );
 }
 
 /// One Budget check-in row: icon chip + name, "₹980 of ₹5.0k",
@@ -3692,20 +4660,14 @@ class _TxnRowPlain extends StatelessWidget {
       padding: const EdgeInsets.symmetric(vertical: 9),
       child: Row(
         children: [
-          Container(
-            height: 42,
-            width: 42,
-            decoration: BoxDecoration(
-              color: chip,
-              borderRadius: BorderRadius.circular(12),
-            ),
-            child: Icon(
-              t.source == TxnSource.statement
-                  ? Icons.account_balance_outlined
-                  : icon,
-              color: color,
-              size: 20,
-            ),
+          KIconTile(
+            icon: t.source == TxnSource.statement
+                ? Icons.account_balance_outlined
+                : icon,
+            background: chip,
+            foreground: color,
+            size: 44,
+            iconSize: 20,
           ),
           const SizedBox(width: 12),
           Expanded(
@@ -3714,7 +4676,10 @@ class _TxnRowPlain extends StatelessWidget {
               children: [
                 Text(
                   entry.label,
-                  style: const TextStyle(fontWeight: FontWeight.w600),
+                  style: const TextStyle(
+                    fontWeight: FontWeight.w700,
+                    fontSize: 14.5,
+                  ),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                 ),
@@ -3726,47 +4691,21 @@ class _TxnRowPlain extends StatelessWidget {
                 ),
                 // v1.0: tag chip under the subtitle.
                 if (entry.tag != null) ...[
-                  const SizedBox(height: 3),
-                  Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 7,
-                      vertical: 2,
-                    ),
-                    decoration: BoxDecoration(
-                      color: KanakkuTheme.tealSoft,
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: Text(
-                      '#${entry.tag}',
-                      style: const TextStyle(
-                        fontSize: 10,
-                        fontWeight: FontWeight.w700,
-                        color: KanakkuTheme.tealDark,
-                      ),
-                    ),
+                  const SizedBox(height: 4),
+                  PillBadge(
+                    label: '#${entry.tag}',
+                    background: KanakkuTheme.tealSoft,
+                    foreground: KanakkuTheme.primaryDark,
                   ),
                 ],
                 // v1.1 (spec §3.7): recurring-generated entries
                 // carry the ↻ tag.
                 if (entry.origin == 'recurring') ...[
-                  const SizedBox(height: 3),
-                  Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 7,
-                      vertical: 2,
-                    ),
-                    decoration: BoxDecoration(
-                      color: const Color(0xFFFDEFD2),
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: const Text(
-                      '↻ Recurring',
-                      style: TextStyle(
-                        fontSize: 10,
-                        fontWeight: FontWeight.w700,
-                        color: Color(0xFFB45309),
-                      ),
-                    ),
+                  const SizedBox(height: 4),
+                  PillBadge(
+                    label: '↻ Recurring',
+                    background: KanakkuTheme.badgeAmberBg,
+                    foreground: KanakkuTheme.badgeAmberFg,
                   ),
                 ],
               ],
@@ -3777,8 +4716,8 @@ class _TxnRowPlain extends StatelessWidget {
             children: [
               Text(
                 '${isDebit ? '-' : '+'}${KanakkuTheme.inr(t.amount)}',
-                style: TextStyle(
-                  fontWeight: FontWeight.w700,
+                style: KanakkuTheme.amount(
+                  size: 15,
                   color: isDebit ? KanakkuTheme.debit : KanakkuTheme.credit,
                 ),
               ),
@@ -3914,11 +4853,9 @@ class _TransactionsState extends State<_Transactions> {
     return ListView(
       padding: _pagePadding,
       children: [
-        Text('Transactions', style: KanakkuTheme.serif(size: 28)),
-        const SizedBox(height: 4),
-        Text(
-          'Your income and spending, all in one place.',
-          style: TextStyle(color: KanakkuTheme.inkSoft, fontSize: 14),
+        const KPageHeader(
+          title: 'Transactions',
+          subtitle: 'Your income and spending, all in one place.',
         ),
         const SizedBox(height: 18),
         _TealButton(label: '+  Add transaction', onPressed: widget.onAdd),
@@ -3931,7 +4868,7 @@ class _TransactionsState extends State<_Transactions> {
               side: const BorderSide(color: KanakkuTheme.teal),
               padding: const EdgeInsets.symmetric(vertical: 13),
               shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(14),
+                borderRadius: BorderRadius.circular(20),
               ),
             ),
             onPressed: widget.onUploadStatement,
@@ -3969,6 +4906,8 @@ class _TransactionsState extends State<_Transactions> {
                   label: const Text('All'),
                   selected: _tagFilter == null,
                   selectedColor: KanakkuTheme.tealSoft,
+                  shape: KanakkuTheme.chipShape,
+                  side: KanakkuTheme.chipSide,
                   onSelected: (_) => setState(() => _tagFilter = null),
                 ),
                 for (final t in tags) ...[
@@ -3977,6 +4916,8 @@ class _TransactionsState extends State<_Transactions> {
                     label: Text('#$t'),
                     selected: _tagFilter == t,
                     selectedColor: KanakkuTheme.tealSoft,
+                    shape: KanakkuTheme.chipShape,
+                    side: KanakkuTheme.chipSide,
                     onSelected: (_) => setState(() => _tagFilter = t),
                   ),
                 ],
@@ -3985,38 +4926,36 @@ class _TransactionsState extends State<_Transactions> {
           ),
         ],
         const SizedBox(height: 6),
-        Card(
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
-            child: sorted.isEmpty
-                ? const _EmptyTxns()
-                : visible.isEmpty
-                ? Padding(
-                    padding: const EdgeInsets.symmetric(vertical: 18),
-                    child: Center(
-                      child: Text(
-                        'No transactions tagged #$_tagFilter',
-                        style: TextStyle(color: KanakkuTheme.inkSoft),
-                      ),
+        KCard(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+          child: sorted.isEmpty
+              ? const _EmptyTxns()
+              : visible.isEmpty
+              ? Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 18),
+                  child: Center(
+                    child: Text(
+                      'No transactions tagged #$_tagFilter',
+                      style: TextStyle(color: KanakkuTheme.inkSoft),
                     ),
-                  )
-                : Column(
-                    children: [
-                      for (var i = 0; i < visible.length; i++) ...[
-                        if (i > 0) const Divider(height: 1),
-                        _TxnRowPlain(
-                          entry: visible[i],
-                          onRemove: () => widget.onRemove(visible[i]),
-                          onSplit: () => widget.onSplit(visible[i]),
-                          onRepeat: () => widget.onRepeat(visible[i]),
-                          onEdit: visible[i].txn.source == TxnSource.manual
-                              ? () => widget.onEditEntry(visible[i])
-                              : null,
-                        ),
-                      ],
-                    ],
                   ),
-          ),
+                )
+              : Column(
+                  children: [
+                    for (var i = 0; i < visible.length; i++) ...[
+                      if (i > 0) const Divider(height: 1),
+                      _TxnRowPlain(
+                        entry: visible[i],
+                        onRemove: () => widget.onRemove(visible[i]),
+                        onSplit: () => widget.onSplit(visible[i]),
+                        onRepeat: () => widget.onRepeat(visible[i]),
+                        onEdit: visible[i].txn.source == TxnSource.manual
+                            ? () => widget.onEditEntry(visible[i])
+                            : null,
+                      ),
+                    ],
+                  ],
+                ),
         ),
       ],
     );
@@ -4086,11 +5025,9 @@ class _Budgets extends StatelessWidget {
     return ListView(
       padding: _pagePadding,
       children: [
-        Text('Budgets', style: KanakkuTheme.serif(size: 28)),
-        const SizedBox(height: 4),
-        Text(
-          'Keep spending within your monthly plan.',
-          style: TextStyle(color: KanakkuTheme.inkSoft, fontSize: 14),
+        const KPageHeader(
+          title: 'Budgets',
+          subtitle: 'Keep spending within your monthly plan.',
         ),
         const SizedBox(height: 4),
         // v1.1 (spec §4.5): the honesty line, verbatim, wherever
@@ -4103,23 +5040,22 @@ class _Budgets extends StatelessWidget {
         ...rows.map(
           (r) => Padding(
             padding: const EdgeInsets.only(bottom: 12),
-            child: Card(
-              child: InkWell(
-                borderRadius: BorderRadius.circular(20),
-                onTap: () => onEditBudget(r.category),
-                child: Padding(
-                  padding: const EdgeInsets.all(18),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Row(
-                        children: [
-                          Expanded(
-                            child: Text(
-                              r.category,
-                              style: KanakkuTheme.serif(size: 18),
-                            ),
+            child: KCard(
+              padding: EdgeInsets.zero,
+              onTap: () => onEditBudget(r.category),
+              child: Padding(
+                padding: const EdgeInsets.all(18),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            r.category,
+                            style: KanakkuTheme.sectionTitle(size: 17),
                           ),
+                        ),
                           // v1.1 (spec §4.4): fired-state dot when
                           // this month's 80% or 100% alert fired.
                           if ((firedByCategory[r.category] ?? const {})
@@ -4152,16 +5088,16 @@ class _Budgets extends StatelessWidget {
                       ),
                       const SizedBox(height: 10),
                       // v1.1 (spec §4.4): progress bar with an 80%
-                      // tick mark.
+                      // tick mark (v1.2: fully rounded bar).
                       LayoutBuilder(
                         builder: (ctx, box) => Stack(
                           children: [
                             ClipRRect(
-                              borderRadius: BorderRadius.circular(6),
+                              borderRadius: BorderRadius.circular(999),
                               child: LinearProgressIndicator(
                                 value: r.fraction.clamp(0, 1).toDouble(),
-                                minHeight: 6,
-                                backgroundColor: const Color(0xFFE4E9E7),
+                                minHeight: 7,
+                                backgroundColor: KanakkuTheme.progressTrack,
                                 color: r.over
                                     ? KanakkuTheme.debit
                                     : KanakkuTheme.teal,
@@ -4172,7 +5108,7 @@ class _Budgets extends StatelessWidget {
                               top: 0,
                               child: Container(
                                 width: 2,
-                                height: 6,
+                                height: 7,
                                 color: KanakkuTheme.inkSoft,
                               ),
                             ),
@@ -4192,32 +5128,28 @@ class _Budgets extends StatelessWidget {
                       ],
                     ],
                   ),
-                ),
               ),
             ),
           ),
         ),
-        Card(
-          child: Padding(
-            padding: const EdgeInsets.all(18),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  'Salary split · 50 / 30 / 20',
-                  style: KanakkuTheme.serif(size: 16),
-                ),
-                const SizedBox(height: 4),
-                Text(
-                  'Of the ₹35,000 monthly plan, computed live from this month\'s captured transactions.',
-                  style: TextStyle(color: KanakkuTheme.inkSoft, fontSize: 12),
-                ),
-                const SizedBox(height: 8),
-                splitRow('Needs · 50%', needsSpent, 17500, KanakkuTheme.needs),
-                splitRow('Wants · 30%', wantsSpent, 10500, KanakkuTheme.wants),
-                splitRow('Savings · 20%', saved, 7000, KanakkuTheme.savings),
-              ],
-            ),
+        KCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Salary split · 50 / 30 / 20',
+                style: KanakkuTheme.sectionTitle(size: 16),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                'Of the ₹35,000 monthly plan, computed live from this month\'s captured transactions.',
+                style: TextStyle(color: KanakkuTheme.inkSoft, fontSize: 12),
+              ),
+              const SizedBox(height: 8),
+              splitRow('Needs · 50%', needsSpent, 17500, KanakkuTheme.needs),
+              splitRow('Wants · 30%', wantsSpent, 10500, KanakkuTheme.wants),
+              splitRow('Savings · 20%', saved, 7000, KanakkuTheme.savings),
+            ],
           ),
         ),
         const SizedBox(height: 14),
@@ -4405,31 +5337,24 @@ class _InsightsState extends State<_Insights> {
     final labelMonth = customMonth ? start : chartMonth;
     final mm = labelMonth.month.toString().padLeft(2, '0');
 
-    Widget statCard(String label, String value) => Card(
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              label,
-              style: TextStyle(color: KanakkuTheme.inkSoft, fontSize: 13),
-            ),
-            const SizedBox(height: 4),
-            Text(value, style: KanakkuTheme.serif(size: 28)),
-          ],
-        ),
+    Widget statCard(String label, String value) => KCard(
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(label, style: TextStyle(color: KanakkuTheme.inkSoft, fontSize: 13)),
+          const SizedBox(height: 4),
+          Text(value, style: KanakkuTheme.amount(size: 26)),
+        ],
       ),
     );
 
     return ListView(
       padding: _pagePadding,
       children: [
-        Text('Insights', style: KanakkuTheme.serif(size: 28)),
-        const SizedBox(height: 4),
-        Text(
-          'A quick view of your money movement.',
-          style: TextStyle(color: KanakkuTheme.inkSoft, fontSize: 14),
+        const KPageHeader(
+          title: 'Insights',
+          subtitle: 'A quick view of your money movement.',
         ),
         const SizedBox(height: 14),
         Row(
@@ -4450,51 +5375,41 @@ class _InsightsState extends State<_Insights> {
         statCard('Transactions recorded', '$count'),
         const SizedBox(height: 16),
         // ---- Spending overview (v0.6 card, restyled) ---------------
-        Card(
-          child: Padding(
-            padding: const EdgeInsets.all(20),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            'Spending overview',
-                            style: TextStyle(
-                              fontSize: 17,
-                              fontWeight: FontWeight.w800,
-                            ),
+        KCard(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Spending overview',
+                          style: KanakkuTheme.sectionTitle(size: 17),
+                        ),
+                        SizedBox(height: 2),
+                        Text(
+                          'Your expense pattern through the month',
+                          style: TextStyle(
+                            color: KanakkuTheme.inkSoft,
+                            fontSize: 13,
                           ),
-                          SizedBox(height: 2),
-                          Text(
-                            'Your expense pattern through the month',
-                            style: TextStyle(
-                              color: KanakkuTheme.inkSoft,
-                              fontSize: 13,
-                            ),
-                          ),
-                        ],
-                      ),
+                        ),
+                      ],
                     ),
-                    Container(
-                      height: 40,
-                      width: 40,
-                      decoration: BoxDecoration(
-                        color: KanakkuTheme.tealSoft,
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                      child: const Icon(
-                        Icons.show_chart,
-                        color: KanakkuTheme.teal,
-                        size: 21,
-                      ),
-                    ),
-                  ],
-                ),
+                  ),
+                  const KIconTile(
+                    icon: Icons.show_chart,
+                    background: KanakkuTheme.tealSoft,
+                    foreground: KanakkuTheme.teal,
+                    size: 40,
+                    iconSize: 21,
+                  ),
+                ],
+              ),
                 const SizedBox(height: 18),
                 Row(
                   crossAxisAlignment: CrossAxisAlignment.end,
@@ -4515,7 +5430,7 @@ class _InsightsState extends State<_Insights> {
                             KanakkuTheme.inrCompact(
                               monthSpend(txns, chartMonth),
                             ),
-                            style: KanakkuTheme.serif(size: 30),
+                            style: KanakkuTheme.amount(size: 28),
                           ),
                         ],
                       ),
@@ -4552,10 +5467,8 @@ class _InsightsState extends State<_Insights> {
                                 decoration: BoxDecoration(
                                   color: i == maxWeekIdx
                                       ? KanakkuTheme.teal
-                                      : KanakkuTheme.tealMint,
-                                  borderRadius: const BorderRadius.vertical(
-                                    top: Radius.circular(8),
-                                  ),
+                                      : KanakkuTheme.sage,
+                                  borderRadius: BorderRadius.circular(999),
                                 ),
                               ),
                               const SizedBox(height: 8),
@@ -4600,40 +5513,35 @@ class _InsightsState extends State<_Insights> {
                 ),
               ],
             ),
-          ),
         ),
         const SizedBox(height: 16),
         // ---- Where it goes (v0.6 card, restyled) -------------------
-        Card(
-          child: Padding(
-            padding: const EdgeInsets.all(20),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            'Where it goes',
-                            style: TextStyle(
-                              fontSize: 17,
-                              fontWeight: FontWeight.w800,
-                            ),
+        KCard(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Where it goes',
+                          style: KanakkuTheme.sectionTitle(size: 17),
+                        ),
+                        SizedBox(height: 2),
+                        Text(
+                          'Top spending categories',
+                          style: TextStyle(
+                            color: KanakkuTheme.inkSoft,
+                            fontSize: 13,
                           ),
-                          SizedBox(height: 2),
-                          Text(
-                            'Top spending categories',
-                            style: TextStyle(
-                              color: KanakkuTheme.inkSoft,
-                              fontSize: 13,
-                            ),
-                          ),
-                        ],
-                      ),
+                        ),
+                      ],
                     ),
+                  ),
                     if (cats.isNotEmpty)
                       TextButton(
                         onPressed: () => setState(() => _showAll = !_showAll),
@@ -4654,7 +5562,7 @@ class _InsightsState extends State<_Insights> {
                   children: [
                     Text(
                       KanakkuTheme.inrCompact(total),
-                      style: KanakkuTheme.serif(size: 28),
+                      style: KanakkuTheme.amount(size: 26),
                     ),
                     const SizedBox(width: 8),
                     Text(
@@ -4702,24 +5610,18 @@ class _InsightsState extends State<_Insights> {
                 ],
               ],
             ),
-          ),
         ),
         const SizedBox(height: 12),
         if (leak.isNotEmpty)
-          Card(
+          KCard(
+            padding: EdgeInsets.zero,
             child: ListTile(
-              leading: Container(
-                height: 40,
-                width: 40,
-                decoration: BoxDecoration(
-                  color: KanakkuTheme.tealSoft,
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: const Icon(
-                  Icons.auto_awesome,
-                  color: KanakkuTheme.teal,
-                  size: 20,
-                ),
+              leading: const KIconTile(
+                icon: Icons.auto_awesome,
+                background: KanakkuTheme.tealSoft,
+                foreground: KanakkuTheme.teal,
+                size: 40,
+                iconSize: 20,
               ),
               title: Text(
                 'Top leak: ${leak.first.key}',
@@ -4732,20 +5634,15 @@ class _InsightsState extends State<_Insights> {
           ),
         if (widget.hasStatement) ...[
           const SizedBox(height: 12),
-          Card(
+          KCard(
+            padding: EdgeInsets.zero,
             child: ListTile(
-              leading: Container(
-                height: 40,
-                width: 40,
-                decoration: BoxDecoration(
-                  color: KanakkuTheme.tealSoft,
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: const Icon(
-                  Icons.analytics_outlined,
-                  color: KanakkuTheme.teal,
-                  size: 20,
-                ),
+              leading: const KIconTile(
+                icon: Icons.analytics_outlined,
+                background: KanakkuTheme.tealSoft,
+                foreground: KanakkuTheme.teal,
+                size: 40,
+                iconSize: 20,
               ),
               title: const Text(
                 'Statement analysis',
@@ -4765,7 +5662,7 @@ class _InsightsState extends State<_Insights> {
         const SizedBox(height: 22),
         Text(
           'Export your transactions as CSV',
-          style: KanakkuTheme.serif(size: 19),
+          style: KanakkuTheme.sectionTitle(size: 17),
         ),
         const SizedBox(height: 12),
         _TealButton(label: 'Export CSV', onPressed: widget.onExportCsv),
@@ -4778,7 +5675,7 @@ class _InsightsState extends State<_Insights> {
               side: const BorderSide(color: KanakkuTheme.teal),
               padding: const EdgeInsets.symmetric(vertical: 14),
               shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(14),
+                borderRadius: BorderRadius.circular(20),
               ),
             ),
             onPressed: widget.onExportPdf,
@@ -4806,15 +5703,7 @@ class _CategoryRow extends StatelessWidget {
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Container(
-            height: 44,
-            width: 44,
-            decoration: BoxDecoration(
-              color: chip,
-              borderRadius: BorderRadius.circular(13),
-            ),
-            child: Icon(icon, color: bar, size: 21),
-          ),
+          KIconTile(icon: icon, background: chip, foreground: bar),
           const SizedBox(width: 12),
           Expanded(
             child: Column(
@@ -4855,15 +5744,7 @@ class _CategoryRow extends StatelessWidget {
                   ],
                 ),
                 const SizedBox(height: 7),
-                ClipRRect(
-                  borderRadius: BorderRadius.circular(6),
-                  child: LinearProgressIndicator(
-                    value: total.share.clamp(0, 1),
-                    minHeight: 7,
-                    backgroundColor: bar.withValues(alpha: 0.14),
-                    color: bar,
-                  ),
-                ),
+                RoundedProgress(value: total.share, color: bar),
               ],
             ),
           ),
@@ -5022,9 +5903,9 @@ class _SplitSheetState extends State<_SplitSheet> {
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text(
+            Text(
               'Split bill',
-              style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
+              style: KanakkuTheme.sectionTitle(size: 18),
             ),
             const SizedBox(height: 4),
             Text(
@@ -5034,8 +5915,8 @@ class _SplitSheetState extends State<_SplitSheet> {
             const SizedBox(height: 12),
             TextField(
               controller: _payer,
-              decoration: const InputDecoration(
-                labelText: 'Paid by (name, or You)',
+              decoration: KanakkuTheme.wellDecoration(
+                label: 'Paid by (name, or You)',
               ),
               onChanged: (_) => setState(() {}),
             ),
@@ -5043,6 +5924,7 @@ class _SplitSheetState extends State<_SplitSheet> {
               contentPadding: EdgeInsets.zero,
               title: const Text('Include me in the split'),
               value: _includeMe,
+              activeThumbColor: KanakkuTheme.teal,
               onChanged: (v) => setState(() => _includeMe = v),
             ),
             if (_custom && _includeMe)
@@ -5056,9 +5938,9 @@ class _SplitSheetState extends State<_SplitSheet> {
                       keyboardType: const TextInputType.numberWithOptions(
                         decimal: true,
                       ),
-                      decoration: const InputDecoration(
-                        prefixText: '₹ ',
-                        labelText: 'Share',
+                      decoration: KanakkuTheme.wellDecoration(
+                        prefix: '₹ ',
+                        label: 'Share',
                       ),
                     ),
                   ),
@@ -5070,8 +5952,8 @@ class _SplitSheetState extends State<_SplitSheet> {
                   Expanded(
                     child: TextField(
                       controller: _names[i],
-                      decoration: InputDecoration(
-                        labelText: 'Person ${i + 1} name',
+                      decoration: KanakkuTheme.wellDecoration(
+                        label: 'Person ${i + 1} name',
                       ),
                       onChanged: (_) => setState(() {}),
                     ),
@@ -5085,9 +5967,9 @@ class _SplitSheetState extends State<_SplitSheet> {
                         keyboardType: const TextInputType.numberWithOptions(
                           decimal: true,
                         ),
-                        decoration: const InputDecoration(
-                          prefixText: '₹ ',
-                          labelText: 'Share',
+                        decoration: KanakkuTheme.wellDecoration(
+                          prefix: '₹ ',
+                          label: 'Share',
                         ),
                       ),
                     ),
@@ -5110,6 +5992,7 @@ class _SplitSheetState extends State<_SplitSheet> {
               title: const Text('Custom amounts'),
               subtitle: const Text('Off = equal split for everyone'),
               value: _custom,
+              activeThumbColor: KanakkuTheme.teal,
               onChanged: (v) => setState(() => _custom = v),
             ),
             if (!_custom && people.length >= 2)
@@ -5129,8 +6012,11 @@ class _SplitSheetState extends State<_SplitSheet> {
               width: double.infinity,
               child: FilledButton(
                 style: FilledButton.styleFrom(
-                  backgroundColor: KanakkuTheme.orange,
+                  backgroundColor: KanakkuTheme.primary,
                   padding: const EdgeInsets.symmetric(vertical: 14),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(20),
+                  ),
                 ),
                 onPressed: _save,
                 child: const Text(
@@ -5166,24 +6052,19 @@ class _SplitsPage extends StatelessWidget {
     return ListView(
       padding: _pagePadding,
       children: [
-        Text('Split bills', style: KanakkuTheme.serif(size: 28)),
-        const SizedBox(height: 4),
-        Text(
-          'Split any expense from the ⋮ menu on a transaction. Settled shares drop out of the balances.',
-          style: TextStyle(color: KanakkuTheme.inkSoft, fontSize: 13),
+        const KPageHeader(
+          title: 'Split bills',
+          subtitle:
+              'Split any expense from the ⋮ menu on a transaction. Settled shares drop out of the balances.',
         ),
         const SizedBox(height: 12),
-        Card(
-          child: Padding(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text(
-                  'Balances',
-                  style: TextStyle(fontWeight: FontWeight.w700),
-                ),
-                const SizedBox(height: 8),
+        KCard(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('Balances', style: KanakkuTheme.sectionTitle(size: 15)),
+              const SizedBox(height: 8),
                 if (balanceRows.isEmpty)
                   Text(
                     'All settled. Nobody owes anybody.',
@@ -5217,15 +6098,15 @@ class _SplitsPage extends StatelessWidget {
                   ),
               ],
             ),
-          ),
         ),
         const SizedBox(height: 12),
         if (splits.isEmpty)
-          const Card(
+          const KCard(
+            padding: EdgeInsets.zero,
             child: ListTile(
               leading: Icon(
                 Icons.call_split_outlined,
-                color: KanakkuTheme.orange,
+                color: KanakkuTheme.primary,
               ),
               title: Text('No splits yet'),
               subtitle: Text('Open any expense, tap ⋮ → Split bill.'),
@@ -5233,32 +6114,30 @@ class _SplitsPage extends StatelessWidget {
           )
         else
           ...splits.map(
-            (s) => Card(
-              child: Padding(
+            (s) => Padding(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: KCard(
                 padding: const EdgeInsets.all(16),
                 child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      children: [
-                        Expanded(
-                          child: Text(
-                            '${s.label} · ${KanakkuTheme.inr(s.total)}',
-                            style: const TextStyle(fontWeight: FontWeight.w700),
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          '${s.label} · ${KanakkuTheme.inr(s.total)}',
+                          style: const TextStyle(
+                            fontWeight: FontWeight.w700,
+                            fontSize: 15,
                           ),
                         ),
-                        if (s.allSettled)
-                          const Chip(
-                            label: Text(
-                              'Settled',
-                              style: TextStyle(
-                                fontSize: 11,
-                                fontWeight: FontWeight.w700,
-                              ),
-                            ),
-                            backgroundColor: Color(0xFFF0FDF4),
-                            side: BorderSide.none,
-                          ),
+                      ),
+                      if (s.allSettled)
+                        PillBadge(
+                          label: 'Settled',
+                          background: KanakkuTheme.badgeGreenBg,
+                          foreground: KanakkuTheme.badgeGreenFg,
+                        ),
                         IconButton(
                           onPressed: () => onDelete(s.id),
                           icon: const Icon(Icons.delete_outline, size: 20),
@@ -5753,20 +6632,32 @@ class _SettingsPageState extends State<_SettingsPage> {
     String? value,
     VoidCallback? onTap,
     Widget? trailing,
-  }) => Card(
-    margin: const EdgeInsets.only(bottom: 8),
-    child: ListTile(
-      leading: Icon(icon, color: KanakkuTheme.teal),
-      title: Text(title),
-      subtitle: value == null
-          ? null
-          : Text(value, style: TextStyle(color: KanakkuTheme.inkSoft)),
-      trailing:
-          trailing ??
-          (onTap != null
-              ? Icon(Icons.chevron_right, color: KanakkuTheme.inkSoft)
-              : null),
-      onTap: onTap,
+  }) => Padding(
+    padding: const EdgeInsets.only(bottom: 8),
+    child: KCard(
+      padding: EdgeInsets.zero,
+      child: ListTile(
+        leading: KIconTile(
+          icon: icon,
+          background: KanakkuTheme.tealSoft,
+          foreground: KanakkuTheme.teal,
+          size: 40,
+          iconSize: 20,
+        ),
+        title: Text(
+          title,
+          style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 15),
+        ),
+        subtitle: value == null
+            ? null
+            : Text(value, style: TextStyle(color: KanakkuTheme.inkSoft)),
+        trailing:
+            trailing ??
+            (onTap != null
+                ? Icon(Icons.chevron_right, color: KanakkuTheme.inkSoft)
+                : null),
+        onTap: onTap,
+      ),
     ),
   );
 
@@ -5795,43 +6686,40 @@ class _SettingsPageState extends State<_SettingsPage> {
           // set), bold serif username with the pencil on the card,
           // "Local account" subtitle (Kanakku has no sign-in and
           // does not fake one), backup nudge under a hairline.
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      CircleAvatar(
-                        radius: 26,
-                        backgroundColor: KanakkuTheme.teal,
-                        child: _s.profileName.isEmpty
-                            ? const Icon(
-                                Icons.person,
+          KCard(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    CircleAvatar(
+                      radius: 26,
+                      backgroundColor: KanakkuTheme.teal,
+                      child: _s.profileName.isEmpty
+                          ? const Icon(
+                              Icons.person,
+                              color: Colors.white,
+                              size: 28,
+                            )
+                          : Text(
+                              _s.profileName[0].toUpperCase(),
+                              style: const TextStyle(
                                 color: Colors.white,
-                                size: 28,
-                              )
-                            : Text(
-                                _s.profileName[0].toUpperCase(),
-                                style: const TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 22,
-                                  fontWeight: FontWeight.w700,
-                                ),
+                                fontSize: 22,
+                                fontWeight: FontWeight.w700,
                               ),
-                      ),
-                      const SizedBox(width: 14),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              _s.profileName.isEmpty
-                                  ? 'Guest'
-                                  : _s.profileName,
-                              style: KanakkuTheme.serif(size: 21),
                             ),
+                    ),
+                    const SizedBox(width: 14),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            _s.profileName.isEmpty ? 'Guest' : _s.profileName,
+                            style: KanakkuTheme.sectionTitle(size: 20),
+                          ),
                             Text(
                               'Local account',
                               style: TextStyle(
@@ -5880,24 +6768,31 @@ class _SettingsPageState extends State<_SettingsPage> {
                     children: [
                       ActionChip(
                         label: const Text('Transactions'),
+                        shape: KanakkuTheme.chipShape,
+                        side: KanakkuTheme.chipSide,
                         onPressed: () => widget.onJumpTab(1),
                       ),
                       ActionChip(
                         label: const Text('Budgets'),
+                        shape: KanakkuTheme.chipShape,
+                        side: KanakkuTheme.chipSide,
                         onPressed: () => widget.onJumpTab(2),
                       ),
                       ActionChip(
                         label: const Text('Categories'),
+                        shape: KanakkuTheme.chipShape,
+                        side: KanakkuTheme.chipSide,
                         onPressed: widget.onOpenCategories,
                       ),
                       ActionChip(
                         label: const Text('Insights'),
+                        shape: KanakkuTheme.chipShape,
+                        side: KanakkuTheme.chipSide,
                         onPressed: () => widget.onJumpTab(3),
                       ),
                     ],
                   ),
                 ],
-              ),
             ),
           ),
 
@@ -6324,25 +7219,28 @@ class _SettingsPageState extends State<_SettingsPage> {
 
           // ---- 10. Danger Zone ------------------------------------------
           _section('Danger Zone'),
-          Card(
-            margin: const EdgeInsets.only(bottom: 8),
-            child: ListTile(
-              leading: const Icon(
-                Icons.delete_forever_outlined,
-                color: KanakkuTheme.debit,
-              ),
-              title: const Text(
-                'Delete Data & Start Afresh',
-                style: TextStyle(
+          Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: KCard(
+              padding: EdgeInsets.zero,
+              child: ListTile(
+                leading: const Icon(
+                  Icons.delete_forever_outlined,
                   color: KanakkuTheme.debit,
-                  fontWeight: FontWeight.w700,
                 ),
+                title: const Text(
+                  'Delete Data & Start Afresh',
+                  style: TextStyle(
+                    color: KanakkuTheme.debit,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                subtitle: Text(
+                  'Permanently deletes everything on this phone. No undo.',
+                  style: TextStyle(color: KanakkuTheme.inkSoft),
+                ),
+                onTap: _dangerWipe,
               ),
-              subtitle: Text(
-                'Permanently deletes everything on this phone. No undo.',
-                style: TextStyle(color: KanakkuTheme.inkSoft),
-              ),
-              onTap: _dangerWipe,
             ),
           ),
         ],
@@ -6352,7 +7250,7 @@ class _SettingsPageState extends State<_SettingsPage> {
 }
 
 /// App version shown in About (kept in step with pubspec.yaml).
-const kanakkuVersion = '1.1.5';
+const kanakkuVersion = '1.2.0';
 
 const _privacyText = '''
 Kanakku keeps your money data on this phone. Nothing is uploaded to a server — there is no Kanakku account and no cloud copy.
@@ -7823,261 +8721,6 @@ String greetingFor(DateTime now) {
   return 'Good evening';
 }
 
-/// Top brand bar (reference): teal dot logo + serif "Kanakku",
-/// "PERSONAL FINANCE" letter-spaced caps on the right, gear for
-/// Settings (app lock + daily summary live there).
-class _BrandBar extends StatelessWidget {
-  final VoidCallback onSettings;
-  const _BrandBar({required this.onSettings});
-  @override
-  Widget build(BuildContext context) => SafeArea(
-    bottom: false,
-    child: Padding(
-      padding: const EdgeInsets.fromLTRB(20, 10, 8, 6),
-      child: Row(
-        children: [
-          Container(
-            height: 26,
-            width: 26,
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              border: Border.all(color: KanakkuTheme.teal, width: 2),
-            ),
-            child: const Center(
-              child: CircleAvatar(
-                radius: 5,
-                backgroundColor: KanakkuTheme.teal,
-              ),
-            ),
-          ),
-          const SizedBox(width: 10),
-          Text(
-            'Kanakku',
-            style: KanakkuTheme.serif(size: 24, color: KanakkuTheme.teal),
-          ),
-          const Spacer(),
-          Text(
-            'PERSONAL FINANCE',
-            style: TextStyle(
-              color: KanakkuTheme.inkSoft,
-              fontSize: 10,
-              letterSpacing: 1.8,
-              fontWeight: FontWeight.w600,
-            ),
-          ),
-          IconButton(
-            onPressed: onSettings,
-            icon: Icon(
-              Icons.settings_outlined,
-              color: KanakkuTheme.inkSoft,
-              size: 21,
-            ),
-            tooltip: 'Settings',
-            visualDensity: VisualDensity.compact,
-          ),
-        ],
-      ),
-    ),
-  );
-}
-
-/// Floating glass bottom bar (v1.0.1, iOS-style, from the
-/// reference "More" tab): a frosted pill hovering over the page —
-/// the shell sets extendBody, so scrolled content slides behind
-/// the blur. All five destinations stay; icons return for the
-/// footer only, flanking a raised circular Add button that
-/// overlaps the pill's top edge and opens the Add sheet.
-class _GlassBottomNav extends StatelessWidget {
-  final int selected;
-  final void Function(int) onSelect;
-  final VoidCallback onAdd;
-  const _GlassBottomNav({
-    required this.selected,
-    required this.onSelect,
-    required this.onAdd,
-  });
-
-  /// (inactive icon, active icon, label) per destination, in tab
-  /// order: Home · Transactions | + | Budgets · Insights · Splits.
-  static const _items = <(IconData, IconData, String)>[
-    (Icons.home_outlined, Icons.home, 'Home'),
-    (Icons.receipt_long_outlined, Icons.receipt_long, 'Transactions'),
-    (
-      Icons.account_balance_wallet_outlined,
-      Icons.account_balance_wallet,
-      'Budgets',
-    ),
-    (Icons.insights_outlined, Icons.insights, 'Insights'),
-    (Icons.call_split_outlined, Icons.call_split, 'Splits'),
-  ];
-
-  Widget _item(int i) {
-    final (off, on, label) = _items[i];
-    final active = i == selected;
-    final color = active ? KanakkuTheme.teal : KanakkuTheme.inkSoft;
-    return Expanded(
-      child: GestureDetector(
-        key: ValueKey<String>('glass-nav-item-$i'),
-        behavior: HitTestBehavior.opaque,
-        onTap: () => onSelect(i),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Icon(active ? on : off, size: 22, color: color),
-            const SizedBox(height: 2),
-            // Single line, shrunk to fit: "Transactions" at 10.5px
-            // is wider than its slot and used to WRAP (v1.0.2 fix),
-            // which also made that item taller than the others.
-            FittedBox(
-              fit: BoxFit.scaleDown,
-              child: Text(
-                label,
-                maxLines: 1,
-                softWrap: false,
-                style: TextStyle(
-                  fontSize: 10.5,
-                  fontWeight: active ? FontWeight.w800 : FontWeight.w500,
-                  color: color,
-                ),
-              ),
-            ),
-            const SizedBox(height: 1),
-            // The v1.0 teal dot, kept as the active marker. The
-            // 4px slot is reserved in EVERY item (dot painted only
-            // for the active one) so all five items share identical
-            // geometry, active or not.
-            SizedBox(
-              height: 4,
-              child: active
-                  ? const CircleAvatar(
-                      radius: 2,
-                      backgroundColor: KanakkuTheme.teal,
-                    )
-                  : null,
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final bottomInset = MediaQuery.paddingOf(context).bottom;
-    final rim = KanakkuTheme.isDark
-        ? Colors.white.withValues(alpha: 0.35)
-        : Colors.black.withValues(alpha: 0.35);
-    return Padding(
-      padding: EdgeInsets.fromLTRB(16, 0, 16, 14 + bottomInset),
-      child: SizedBox(
-        height: 78,
-        child: Stack(
-          clipBehavior: Clip.none,
-          children: [
-            // The frosted pill: shadowed, blurred, translucent.
-            Positioned(
-              left: 0,
-              right: 0,
-              bottom: 0,
-              child: Container(
-                height: 64,
-                decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(28),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.black.withValues(alpha: 0.18),
-                      blurRadius: 24,
-                      offset: const Offset(0, 8),
-                    ),
-                  ],
-                ),
-                child: ClipRRect(
-                  borderRadius: BorderRadius.circular(28),
-                  child: BackdropFilter(
-                    filter: ui.ImageFilter.blur(sigmaX: 18, sigmaY: 18),
-                    child: Container(
-                      decoration: BoxDecoration(
-                        color: KanakkuTheme.card.withValues(alpha: 0.72),
-                        borderRadius: BorderRadius.circular(28),
-                        border: Border.all(color: rim),
-                      ),
-                      // Two Expanded groups around a fixed 76px
-                      // centre segment: flex 2 / flex 3 with every
-                      // item itself Expanded, so all five slots
-                      // are EXACTLY equal width — (pillWidth − 76)
-                      // ÷ 5 each (v1.0.2 alignment fix, v1.0.3
-                      // centre segment).
-                      child: Row(
-                        children: [
-                          Expanded(
-                            flex: 2,
-                            child: Row(children: [_item(0), _item(1)]),
-                          ),
-                          const SizedBox(width: 76),
-                          Expanded(
-                            flex: 3,
-                            child: Row(
-                              children: [_item(2), _item(3), _item(4)],
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-            ),
-            // Raised centre Add button, straddling the top edge.
-            // v1.0.3: the button is centred in the bar's 76px
-            // centre SEGMENT, not on the pill. With the 2-left /
-            // 3-right split, the pill's own centre falls ~29px
-            // inside the Budgets slot, so a pill-centred circle
-            // (v1.0.1/v1.0.2) overlapped Budgets' icon. This
-            // layer mirrors the pill row's exact segment geometry
-            // (Spacer flex 2 · 76 · Spacer flex 3), so the 56px
-            // circle sits centred in the segment with 10px
-            // clearance each side — it can never touch a slot.
-            Positioned.fill(
-              child: Row(
-                children: [
-                  const Spacer(flex: 2),
-                  SizedBox(
-                    width: 76,
-                    child: Align(
-                      alignment: Alignment.topCenter,
-                      child: Material(
-                        key: const ValueKey<String>('glass-nav-add'),
-                        color: const Color(0xFF232323),
-                        shape: const CircleBorder(),
-                        elevation: 6,
-                        shadowColor: Colors.black.withValues(alpha: 0.4),
-                        child: InkWell(
-                          customBorder: const CircleBorder(),
-                          onTap: onAdd,
-                          child: const SizedBox(
-                            width: 56,
-                            height: 56,
-                            child: Icon(
-                              Icons.add,
-                              color: Colors.white,
-                              size: 28,
-                            ),
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-                  const Spacer(flex: 3),
-                ],
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
 /// "This month ▾" pill (reference). White, rounded, thin border.
 class _PeriodSelector extends StatelessWidget {
   final PeriodSel period;
@@ -8086,9 +8729,8 @@ class _PeriodSelector extends StatelessWidget {
   @override
   Widget build(BuildContext context) => Container(
     decoration: BoxDecoration(
-      color: KanakkuTheme.card,
-      borderRadius: BorderRadius.circular(12),
-      border: Border.all(color: KanakkuTheme.dividerColor),
+      color: KanakkuTheme.surfaceAlt,
+      borderRadius: BorderRadius.circular(999),
     ),
     child: PopupMenuButton<PeriodSel>(
       initialValue: period,
@@ -8127,7 +8769,7 @@ class _TealButton extends StatelessWidget {
       style: FilledButton.styleFrom(
         backgroundColor: KanakkuTheme.teal,
         padding: const EdgeInsets.symmetric(vertical: 15),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
       ),
       onPressed: onPressed,
       child: Text(
@@ -8146,14 +8788,12 @@ class _StatCard extends StatelessWidget {
   final String sub;
   final Color? subColor;
   final bool filled;
-  final double? progress;
   const _StatCard({
     required this.title,
     required this.value,
     required this.sub,
     this.subColor,
     this.filled = false,
-    this.progress,
   });
   @override
   Widget build(BuildContext context) {
@@ -8196,18 +8836,6 @@ class _StatCard extends StatelessWidget {
               fontWeight: FontWeight.w600,
             ),
           ),
-          if (progress != null) ...[
-            const SizedBox(height: 8),
-            ClipRRect(
-              borderRadius: BorderRadius.circular(6),
-              child: LinearProgressIndicator(
-                value: progress!.clamp(0, 1),
-                minHeight: 6,
-                backgroundColor: const Color(0xFFE4E9E7),
-                color: KanakkuTheme.teal,
-              ),
-            ),
-          ],
         ],
       ),
     );

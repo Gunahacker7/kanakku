@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Upcoming renewals widget metadata (v1.2 Phase 3).
+     updatePeriodMillis is the platform minimum (30 min); fresher
+     updates come from the Refresh pill and the app's own writes. -->
+<appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+    android:minWidth="250dp"
+    android:minHeight="180dp"
+    android:targetCellWidth="4"
+    android:targetCellHeight="3"
+    android:updatePeriodMillis="1800000"
+    android:initialLayout="@layout/widget_upcoming"
+    android:description="@string/widget_upcoming_description"
+    android:previewImage="@mipmap/ic_launcher"
+    android:resizeMode="horizontal|vertical"
+    android:widgetCategory="home_screen" />

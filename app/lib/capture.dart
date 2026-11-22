@@ -365,6 +365,32 @@ class CaptureService {
     } catch (_) {}
   }
 
+  /// Subscriptions document (v1.2): one JSON string in its own
+  /// native store, following the recurring-store pattern. '' means
+  /// the store was never written (pre-v1.2 install) — the migration
+  /// seeding and the defensive decoder treat that as the empty
+  /// document.
+  Future<String> loadSubscriptionsJson() async {
+    try {
+      return await _ch.invokeMethod<String>('getSubscriptions') ?? '';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  /// Persists the subscriptions document with a synchronous native
+  /// commit (like setRecurring), returning the real result.
+  Future<bool> saveSubscriptionsJson(String json) async {
+    try {
+      return await _ch.invokeMethod<bool>('setSubscriptions', {
+            'json': json,
+          }) ??
+          false;
+    } catch (_) {
+      return false;
+    }
+  }
+
   /// Posts a budget-alert notification natively (BudgetNotifier).
   /// Returns whether the notification was actually posted — the
   /// 2-per-day cap counts only real posts (spec §4.3 rule 2).

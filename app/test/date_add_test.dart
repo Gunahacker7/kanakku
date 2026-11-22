@@ -22,9 +22,9 @@ const _months = [
 String _fmt(DateTime d) => '${d.day} ${_months[d.month - 1]} ${d.year}';
 
 Future<void> _openSheet(WidgetTester tester) async {
-  await tester.tap(find.text('Transactions'));
-  await tester.pumpAndSettle();
-  await tester.tap(find.text('+  Add transaction'));
+  // v1.2: no Transactions tab — the Add sheet opens from the Home
+  // greeting header's circular + button.
+  await tester.tap(find.byIcon(Icons.add));
   await tester.pumpAndSettle();
   expect(find.text('Log expense'), findsOneWidget);
 }
@@ -68,6 +68,9 @@ void main() {
     expect(find.text('Yesterday · ${_fmt(yday)}'), findsOneWidget);
 
     await _saveExpense(tester, amount: '250', note: 'YdayEntry');
+    // v1.2: the saved row lives in Home's Recent list — scroll it in.
+    await tester.scrollUntilVisible(find.text('YdayEntry'), 200);
+    await tester.pumpAndSettle();
     expect(find.text('YdayEntry'), findsWidgets);
     expect(find.text('-₹250'), findsOneWidget);
     // v1.0.1 regression: the note rides as the row subtitle — the
@@ -102,13 +105,15 @@ void main() {
     await _saveExpense(tester, amount: '111', note: 'AlphaToday');
 
     // Entry 2: yesterday (backdated via the quick chip).
-    await tester.tap(find.text('+  Add transaction'));
+    await tester.tap(find.byIcon(Icons.add));
     await tester.pumpAndSettle();
     await tester.tap(find.widgetWithText(ChoiceChip, 'Yesterday'));
     await tester.pumpAndSettle();
     await _saveExpense(tester, amount: '222', note: 'BetaYday');
 
     // Newest first: today's entry renders above yesterday's.
+    await tester.scrollUntilVisible(find.text('AlphaToday'), 200);
+    await tester.pumpAndSettle();
     final todayPos = tester.getTopLeft(find.text('AlphaToday').first);
     final ydayPos = tester.getTopLeft(find.text('BetaYday').first);
     expect(todayPos.dy, lessThan(ydayPos.dy));

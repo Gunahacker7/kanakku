@@ -13,10 +13,8 @@ void main() {
     await tester.pumpWidget(const KanakkuApp());
     await tester.pumpAndSettle();
 
-    // Transactions tab → big Add button at the top.
-    await tester.tap(find.text('Transactions'));
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('+  Add transaction'));
+    // v1.2: the Add sheet opens from the Home greeting header's +.
+    await tester.tap(find.byIcon(Icons.add));
     await tester.pumpAndSettle();
 
     // Sheet opens in Expense mode; switch to Income.
@@ -35,13 +33,20 @@ void main() {
     await tester.tap(find.widgetWithText(FilledButton, 'Add income'));
     await tester.pumpAndSettle();
 
-    // The entry is listed as a credit with the chosen label.
+    // The entry is listed as a credit with the chosen label
+    // (Home's Recent list — scroll it into view).
+    await tester.scrollUntilVisible(find.text('+₹5,000'), 200);
+    await tester.pumpAndSettle();
     expect(find.text('Salary'), findsWidgets);
     expect(find.text('+₹5,000'), findsOneWidget);
 
-    // Home: with a manual entry present the app runs on real data —
-    // hero net balance and the Total income stat both carry it.
-    await tester.tap(find.text('Home'));
+    // Totals: the Insights page (Home → Explore) carries the
+    // manual income in its Total income stat.
+    await tester.scrollUntilVisible(find.text('Insights'), -200);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Insights'));
+    await tester.pumpAndSettle();
+    await tester.scrollUntilVisible(find.text('Total income'), 200);
     await tester.pumpAndSettle();
     expect(find.text('Total income'), findsOneWidget);
     expect(find.text('₹5,000'), findsWidgets);

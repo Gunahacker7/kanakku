@@ -112,6 +112,8 @@ void main() {
         // v1.1 (spec §6.2): backups carry the recurring document
         // inside the same envelope.
         'recurring': '{"nextRuleSeq":1,"rules":[]}',
+        // v1.2: subscriptions ride in the same envelope, additively.
+        'subscriptions': '{"nextSubSeq":1,"subscriptions":[]}',
       };
       final settings = const KanakkuSettings(profileName: 'Guna').toJson();
       final backup = buildBackup(
@@ -299,7 +301,7 @@ void main() {
     expect(find.textContaining('Dark Kanakku'), findsOneWidget);
     final ctx = tester.element(find.textContaining('Dark Kanakku'));
     expect(Theme.of(ctx).brightness, Brightness.dark);
-    expect(KanakkuTheme.card, const Color(0xFF1D2A24));
+    expect(KanakkuTheme.card, const Color(0xFF1F2420));
   });
 
   testWidgets('Add sheet pre-selects the default payment mode from settings', (
@@ -345,9 +347,8 @@ void main() {
     for (var i = 0; i < 6; i++) {
       await tester.pump(const Duration(milliseconds: 60));
     }
-    await tester.tap(find.text('Transactions'));
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('+  Add transaction'));
+    // v1.2: the Add sheet opens from the Home greeting header's +.
+    await tester.tap(find.byIcon(Icons.add));
     await tester.pumpAndSettle();
 
     // The UPI chip (from settings) is the selected payment mode.

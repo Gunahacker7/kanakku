@@ -42,6 +42,8 @@ class MainActivity : FlutterActivity() {
         // v1.1 (spec §6.1): seed the recurring + alert-state
         // documents on first launch of the new version.
         CaptureStore.runV110Migrations(this)
+        // v1.2: seed the subscriptions document likewise.
+        CaptureStore.runV120Migrations(this)
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -134,6 +136,22 @@ class MainActivity : FlutterActivity() {
                         CaptureStore.setAlertState(this, call.argument<String>("json") ?: "{}")
                         result.success(true)
                     }
+                    "getSubscriptions" -> result.success(CaptureStore.subscriptions(this))
+                    "setSubscriptions" -> {
+                        // Commit write like setRecurring.
+                        val json = call.argument<String>("json") ?: ""
+                        Thread {
+                            val saved = runCatching { CaptureStore.setSubscriptions(this@MainActivity, json) }
+                                .getOrDefault(false)
+                            // v1.2 Phase 3: keep the Upcoming
+                            // home-screen widget fresh on every
+                            // subscriptions write.
+                            if (saved) {
+                                runCatching { UpcomingWidget.updateAll(this@MainActivity) }
+                            }
+                            runOnUiThread { result.success(saved) }
+                        }.start()
+                    }
                     "postBudgetAlert" -> {
                         val title = call.argument<String>("title") ?: "Budget alert"
                         val body = call.argument<String>("body") ?: ""
@@ -149,6 +167,9 @@ class MainActivity : FlutterActivity() {
                         SummaryNotifier.disarm(this)
                         CaptureStore.clearAll(this)
                         PinStore.clear(this)
+                        // The subscriptions store is gone too —
+                        // the widget must not keep showing them.
+                        runCatching { UpcomingWidget.updateAll(this) }
                         result.success(true)
                     }
                     "openMail" -> {

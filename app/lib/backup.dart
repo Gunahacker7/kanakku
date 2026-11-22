@@ -40,6 +40,7 @@ const backupEncryptedFormatVersion = 2;
 /// additive; v1.0.4 ignores it on restore, and a v1.0.4 backup
 /// without the key restores as "leave the recurring store
 /// untouched"). Alert state is NEVER backed up (spec §2.3).
+/// v1.2 adds 'subscriptions' the same additive way.
 const backupStoreKeys = <String>[
   'manual',
   'removed',
@@ -48,6 +49,7 @@ const backupStoreKeys = <String>[
   'statement',
   'categories',
   'recurring',
+  'subscriptions',
 ];
 
 Map<String, dynamic> buildBackup({

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Refresh pill: pale green tint, fully rounded. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <solid android:color="#E1EDE5" />
+    <corners android:radius="999dp" />
+</shape>
